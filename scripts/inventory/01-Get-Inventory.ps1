@@ -3,9 +3,8 @@
     Query live state of all Nexus deployment resources and write a snapshot
     to inventory/inventory-YYYYMMDD-HHmmss.json in the project root.
 
-    Checks both configured resources (from .env) AND does a broad name-based
-    search for anything containing "panzura" or "nexus" to catch orphans or
-    resources created outside these scripts.
+    Shows resources scoped to the current user where possible (connectors,
+    agents) so shared-tenant noise doesn't obscure what you own.
 
     Run at any time — each section is independent and skipped if not yet deployed.
     Re-run after any deployment change to capture the updated state.
@@ -25,9 +24,11 @@ $outFile     = Join-Path $outDir "inventory-$fileStamp.json"
 
 $inv = [ordered]@{
     timestamp    = $timestamp
+    identity     = [ordered]@{}
     entra        = [ordered]@{}
     broadSearch  = [ordered]@{}
     powerApps    = [ordered]@{}
+    copilot      = [ordered]@{}
     nexus        = [ordered]@{}
     cloudfs      = [ordered]@{}
     m365         = [ordered]@{}
@@ -37,7 +38,8 @@ function Write-Section { param([string]$t) Write-Host ""; Write-Host $t -Foregro
 function Write-Found   { param([string]$t) Write-Host "  [PASS] $t" -ForegroundColor Green }
 function Write-Missing { param([string]$t) Write-Host "  [MISS] $t" -ForegroundColor Yellow }
 function Write-Warn    { param([string]$t) Write-Host "  [WARN] $t" -ForegroundColor DarkYellow }
-function Write-Extra   { param([string]$t) Write-Host "  [XTRA] $t" -ForegroundColor Magenta }
+function Write-Extra   { param([string]$t) Write-Host "  [XTRA] $t" -ForegroundColor DarkGray }
+function Write-Info    { param([string]$t) Write-Host "  [INFO] $t" -ForegroundColor DarkGray }
 
 Write-Host ""
 Write-Host "Nexus Deployment Inventory — $timestamp" -ForegroundColor White
@@ -60,10 +62,38 @@ try {
 }
 if (-not $graphConnected) {
     try {
-        Connect-MgGraph -TenantId $env:ENTRA_TENANT_ID -Scopes "Application.Read.All","Directory.Read.All","Organization.Read.All" -NoWelcome -ErrorAction Stop
+        Connect-MgGraph -TenantId $env:ENTRA_TENANT_ID -Scopes "Application.Read.All","Directory.Read.All","Organization.Read.All","User.Read" -NoWelcome -ErrorAction Stop
         $graphConnected = $true
     } catch {
         Write-Warn "Graph connection failed: $($_.Exception.Message)"
+    }
+}
+
+# ── Current identity ──────────────────────────────────────────────────────────
+$myUpn         = $null
+$myAadObjectId = $null
+
+Write-Section "Current Identity"
+
+if (-not $graphConnected) {
+    Write-Warn "Graph not connected — cannot resolve user identity"
+} else {
+    try {
+        $ctx = Get-MgContext
+        $myUpn = $ctx.Account
+        if ($myUpn) {
+            $me = Get-MgUser -UserId $myUpn -Property Id,DisplayName,UserPrincipalName -ErrorAction SilentlyContinue
+            $myAadObjectId = $me?.Id
+            Write-Found "Signed in as: $myUpn"
+            Write-Info  "Entra Object ID: $myAadObjectId"
+        } else {
+            Write-Warn "Running as service principal (client-secret auth) — owner-filtered queries will be skipped"
+        }
+        $inv.identity.upn          = $myUpn
+        $inv.identity.aadObjectId  = $myAadObjectId
+        $inv.identity.tenantId     = $env:ENTRA_TENANT_ID
+    } catch {
+        Write-Warn "Could not resolve current user: $($_.Exception.Message)"
     }
 }
 
@@ -81,27 +111,37 @@ if (-not $graphConnected) {
         if ($env:ENTRA_CLIENT_ID) {
             $app = Get-MgApplication -Filter "appId eq '$($env:ENTRA_CLIENT_ID)'" -ErrorAction SilentlyContinue
         }
-        if (-not $app -and $env:ENTRA_APP_NAME) {
-            $app = Get-MgApplication -Filter "displayName eq '$($env:ENTRA_APP_NAME)'" -ErrorAction SilentlyContinue | Select-Object -First 1
-        }
 
         if ($app) {
-            Write-Found "App: $($app.DisplayName) (AppId: $($app.AppId))"
+            Write-Found "App: $($app.DisplayName)  AppId: $($app.AppId)  ObjectId: $($app.Id)"
 
-            $secrets = $app.PasswordCredentials | ForEach-Object {
-                $daysLeft = [int](($_.EndDateTime - (Get-Date)).TotalDays)
-                $status   = if ($daysLeft -lt 0) { "EXPIRED" } elseif ($daysLeft -lt 30) { "EXPIRING SOON" } else { "OK" }
-                Write-Found "  Secret: '$($_.DisplayName)' expires $($_.EndDateTime.ToString('yyyy-MM-dd')) ($daysLeft days) [$status]"
-                [ordered]@{ name = $_.DisplayName; expires = $_.EndDateTime.ToString('yyyy-MM-dd'); daysLeft = $daysLeft; status = $status }
+            # Secrets
+            if ($app.PasswordCredentials) {
+                foreach ($s in $app.PasswordCredentials) {
+                    $daysLeft = [int](($s.EndDateTime - (Get-Date)).TotalDays)
+                    $status   = if ($daysLeft -lt 0) { "EXPIRED" } elseif ($daysLeft -lt 30) { "EXPIRING SOON" } else { "OK" }
+                    $color    = if ($status -eq "OK") { "Green" } elseif ($status -eq "EXPIRING SOON") { "Yellow" } else { "Red" }
+                    Write-Host "  [PASS] Secret: '$($s.DisplayName)'  hint: $($s.Hint)***  expires: $($s.EndDateTime.ToString('yyyy-MM-dd')) ($daysLeft days) [$status]" -ForegroundColor $color
+                }
+            } else {
+                Write-Missing "No client secrets"
             }
 
+            # Redirect URIs
+            $redirectUris = @($app.Web?.RedirectUris) + @($app.Spa?.RedirectUris) | Where-Object { $_ }
+            if ($redirectUris) {
+                foreach ($uri in $redirectUris) { Write-Info "Redirect URI: $uri" }
+            } else {
+                Write-Missing "No redirect URIs registered"
+            }
+
+            # Permissions summary
             $sp = Get-MgServicePrincipal -Filter "appId eq '$($app.AppId)'" -ErrorAction SilentlyContinue
-            $grants = @(); $roleAssignments = @()
             if ($sp) {
-                $grants         = Get-MgServicePrincipalOauth2PermissionGrant -ServicePrincipalId $sp.Id -ErrorAction SilentlyContinue
-                $roleAssignments = Get-MgServicePrincipalAppRoleAssignment    -ServicePrincipalId $sp.Id -ErrorAction SilentlyContinue
-                Write-Found "  Service principal: $($sp.Id)"
-                Write-Found "  Delegated grants: $($grants.Count)   App role assignments: $($roleAssignments.Count)"
+                $grants          = @(Get-MgServicePrincipalOauth2PermissionGrant -ServicePrincipalId $sp.Id -ErrorAction SilentlyContinue)
+                $roleAssignments = @(Get-MgServicePrincipalAppRoleAssignment    -ServicePrincipalId $sp.Id -ErrorAction SilentlyContinue)
+                Write-Info "Service principal: $($sp.Id)"
+                Write-Info "App permissions (roles): $($roleAssignments.Count)   Delegated permissions (scopes): $($grants.Count)"
             }
 
             $inv.entra.app = [ordered]@{
@@ -111,13 +151,16 @@ if (-not $graphConnected) {
                 objectId           = $app.Id
                 createdDateTime    = $app.CreatedDateTime?.ToString('yyyy-MM-dd')
                 servicePrincipalId = $sp?.Id
-                secrets            = @($secrets)
-                delegatedGrants    = $grants.Count
-                appRoleAssignments = $roleAssignments.Count
-                redirectUris       = @($app.Web.RedirectUris)
+                secrets            = @($app.PasswordCredentials | ForEach-Object {
+                    $daysLeft = [int](($_.EndDateTime - (Get-Date)).TotalDays)
+                    [ordered]@{ name = $_.DisplayName; hint = "$($_.Hint)***"; expires = $_.EndDateTime.ToString('yyyy-MM-dd'); daysLeft = $daysLeft; status = if ($daysLeft -lt 0) { "EXPIRED" } elseif ($daysLeft -lt 30) { "EXPIRING SOON" } else { "OK" } }
+                })
+                redirectUris       = @($redirectUris)
+                appRoleAssignments = $roleAssignments?.Count
+                delegatedGrants    = $grants?.Count
             }
         } else {
-            Write-Missing "App '$($env:ENTRA_APP_NAME)' not found"
+            Write-Missing "App not found — ENTRA_CLIENT_ID not set or app not registered yet"
             $inv.entra.app = [ordered]@{ found = $false }
         }
     } catch {
@@ -129,20 +172,16 @@ if (-not $graphConnected) {
 # ── Broad Search — Entra (any app/SP with panzura or nexus in name) ───────────
 Write-Section "Broad Search — Entra (panzura / nexus)"
 
-$inv.broadSearch.entraApps            = @()
+$inv.broadSearch.entraApps              = @()
 $inv.broadSearch.entraServicePrincipals = @()
 
 if (-not $graphConnected) {
     Write-Warn "Skipped — Graph not connected"
 } else {
     try {
-        # Known-safe patterns — Microsoft-managed, not created by our scripts
-        $knownSafe = @(
-            'ConnectSyncProvisioning_*'   # Entra Connect V2 sync agent — name contains DC hostname
-        )
+        $knownSafe = @( 'ConnectSyncProvisioning_*' )
         function Test-KnownSafe { param([string]$name) $knownSafe | Where-Object { $name -like $_ } }
 
-        # App registrations — search both keywords, deduplicate by AppId
         $seenAppIds = @{}
         foreach ($keyword in @('panzura','nexus')) {
             $results = Get-MgApplication -Search "`"displayName:$keyword`"" -ConsistencyLevel eventual -ErrorAction SilentlyContinue
@@ -151,21 +190,14 @@ if (-not $graphConnected) {
                 $seenAppIds[$r.AppId] = $true
                 $isConfigured = ($r.AppId -eq $env:ENTRA_CLIENT_ID)
                 $isSafe       = Test-KnownSafe $r.DisplayName
-                $label = if ($isConfigured) { "(configured)" } elseif ($isSafe) { "(known-safe: Microsoft-managed)" } else { "[other]" }
-                $color = if ($isConfigured) { "Green" } elseif ($isSafe) { "DarkGray" } else { "Magenta" }
+                $label = if ($isConfigured) { "(configured)" } elseif ($isSafe) { "(known-safe)" } else { "[other]" }
+                $color = if ($isConfigured) { "Green" } else { "DarkGray" }
                 Write-Host "  [APP]  $($r.DisplayName)  AppId: $($r.AppId)  $label" -ForegroundColor $color
-                $inv.broadSearch.entraApps += [ordered]@{
-                    displayName = $r.DisplayName
-                    appId       = $r.AppId
-                    objectId    = $r.Id
-                    configured  = $isConfigured
-                    knownSafe   = [bool]$isSafe
-                }
+                $inv.broadSearch.entraApps += [ordered]@{ displayName = $r.DisplayName; appId = $r.AppId; objectId = $r.Id; configured = $isConfigured; knownSafe = [bool]$isSafe }
             }
         }
         if ($inv.broadSearch.entraApps.Count -eq 0) { Write-Missing "No app registrations found matching panzura/nexus" }
 
-        # Service principals — deduplicate by AppId
         $seenSpIds = @{}
         foreach ($keyword in @('panzura','nexus')) {
             $results = Get-MgServicePrincipal -Search "`"displayName:$keyword`"" -ConsistencyLevel eventual -ErrorAction SilentlyContinue
@@ -174,17 +206,10 @@ if (-not $graphConnected) {
                 $seenSpIds[$r.AppId] = $true
                 $isConfigured = ($r.AppId -eq $env:ENTRA_CLIENT_ID)
                 $isSafe       = Test-KnownSafe $r.DisplayName
-                $label = if ($isConfigured) { "(configured)" } elseif ($isSafe) { "(known-safe: Microsoft-managed)" } else { "[other]" }
-                $color = if ($isConfigured) { "Green" } elseif ($isSafe) { "DarkGray" } else { "Magenta" }
-                Write-Host "  [SP]   $($r.DisplayName)  AppId: $($r.AppId)  Type: $($r.ServicePrincipalType)  $label" -ForegroundColor $color
-                $inv.broadSearch.entraServicePrincipals += [ordered]@{
-                    displayName          = $r.DisplayName
-                    appId                = $r.AppId
-                    objectId             = $r.Id
-                    servicePrincipalType = $r.ServicePrincipalType
-                    configured           = $isConfigured
-                    knownSafe            = [bool]$isSafe
-                }
+                $label = if ($isConfigured) { "(configured)" } elseif ($isSafe) { "(known-safe)" } else { "[other]" }
+                $color = if ($isConfigured) { "Green" } else { "DarkGray" }
+                Write-Host "  [SP]   $($r.DisplayName)  AppId: $($r.AppId)  $label" -ForegroundColor $color
+                $inv.broadSearch.entraServicePrincipals += [ordered]@{ displayName = $r.DisplayName; appId = $r.AppId; objectId = $r.Id; servicePrincipalType = $r.ServicePrincipalType; configured = $isConfigured; knownSafe = [bool]$isSafe }
             }
         }
         if ($inv.broadSearch.entraServicePrincipals.Count -eq 0) { Write-Missing "No service principals found matching panzura/nexus" }
@@ -195,11 +220,12 @@ if (-not $graphConnected) {
     }
 }
 
-# ── Power Apps — configured + broad search ────────────────────────────────────
+# ── Power Apps — configured connector + my connectors ────────────────────────
 Write-Section "Power Apps"
 
 $inv.powerApps.environmentUrl = $env:PPAC_ENVIRONMENT_URL
-$inv.powerApps.allConnectors  = @()
+$inv.powerApps.configuredConnector = $null
+$inv.powerApps.myConnectors        = @()
 
 if (-not (Get-Command pac -ErrorAction SilentlyContinue)) {
     Write-Warn "PAC CLI not found — skipping"
@@ -207,49 +233,106 @@ if (-not (Get-Command pac -ErrorAction SilentlyContinue)) {
 } elseif (-not $env:PPAC_ENVIRONMENT_URL) {
     Write-Missing "PPAC_ENVIRONMENT_URL not set"
 } else {
+    # ── Configured connector (exact name match from .env) ─────────────────────
     try {
-        $rawLines = pac connector list --environment $env:PPAC_ENVIRONMENT_URL 2>&1
-
-        # Parse all connectors — each data row has a GUID
+        $rawLines  = pac connector list --environment $env:PPAC_ENVIRONMENT_URL 2>&1
         $guidRegex = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
         $dataLines = $rawLines | Where-Object { $_ -match $guidRegex -and $_ -notmatch '^Connected' }
 
-        foreach ($line in $dataLines) {
-            $id   = ([regex]$guidRegex).Match($line).Value
-            # Name is everything before the GUID, trimmed
-            $name = ($line -replace $guidRegex, '').Trim(' ─-│|')
-            if (-not $name) { $name = "(unknown)" }
-
-            $isConfigured = ($name -match [regex]::Escape($env:CONNECTOR_NAME)) -or ($id -eq '20bdb32b-2e4b-f111-bec5-000d3a5b4866')
-            $isPanzuraNexus = $name -match 'panzura|nexus'
-
-            if ($isConfigured) {
-                Write-Found "Connector: $name (ID: $id) (configured)"
-            } elseif ($isPanzuraNexus) {
-                Write-Extra "Connector: $name (ID: $id) [other — not ours]"
-            }
-
-            $inv.powerApps.allConnectors += [ordered]@{
-                name        = $name
-                id          = $id
-                configured  = $isConfigured
-                isPanzuraNexus = $isPanzuraNexus
-            }
-        }
-
-        $configured = $inv.powerApps.allConnectors | Where-Object { $_.configured }
-        $unexpected = $inv.powerApps.allConnectors | Where-Object { $_.isPanzuraNexus -and -not $_.configured }
-
-        if (-not $configured) {
+        $configuredLine = $dataLines | Where-Object { $_ -match [regex]::Escape($env:CONNECTOR_NAME) } | Select-Object -First 1
+        if ($configuredLine) {
+            $connId = ([regex]$guidRegex).Match($configuredLine).Value
+            Write-Found "Configured connector '$($env:CONNECTOR_NAME)' (ID: $connId)"
+            $inv.powerApps.configuredConnector = [ordered]@{ found = $true; name = $env:CONNECTOR_NAME; id = $connId }
+        } else {
             Write-Missing "Configured connector '$($env:CONNECTOR_NAME)' not found"
+            $inv.powerApps.configuredConnector = [ordered]@{ found = $false; name = $env:CONNECTOR_NAME }
         }
-        if (-not $unexpected -and -not $configured) {
-            Write-Missing "No connectors matching panzura/nexus found in environment"
-        }
-
     } catch {
-        Write-Warn "PAC CLI error: $($_.Exception.Message)"
-        $inv.powerApps.error = $_.Exception.Message
+        Write-Warn "PAC CLI connector list failed: $($_.Exception.Message)"
+    }
+
+    # ── My connectors (all connectors owned by current user) ──────────────────
+    if ($myAadObjectId) {
+        try {
+            Add-PowerAppsAccount -TenantID $env:ENTRA_TENANT_ID -Endpoint prod 2>&1 | Out-Null
+            $orgHost   = ([uri]$env:PPAC_ENVIRONMENT_URL).Host.Split('.')[0]
+            $targetEnv = Get-AdminEnvironment | Where-Object {
+                $_.Internal.properties.linkedEnvironmentMetadata.instanceUrl -match $orgHost
+            } | Select-Object -First 1
+
+            if ($targetEnv) {
+                $allAdminConnectors = @(Get-AdminConnector -EnvironmentName $targetEnv.EnvironmentName -ErrorAction SilentlyContinue)
+                $myConnectors = $allAdminConnectors | Where-Object {
+                    $owner = $_.CreatedBy
+                    $owner -and ($owner.id -eq $myAadObjectId -or $owner.objectId -eq $myAadObjectId -or $owner.userPrincipalName -eq $myUpn)
+                }
+
+                Write-Host ""
+                if ($myConnectors) {
+                    Write-Host "  My connectors in this environment ($myUpn):" -ForegroundColor Cyan
+                    foreach ($c in $myConnectors) {
+                        $isConfigured = ($c.DisplayName -eq $env:CONNECTOR_NAME)
+                        $label = if ($isConfigured) { " (configured)" } else { "" }
+                        $color = if ($isConfigured) { "Green" } else { "DarkGray" }
+                        Write-Host "    $($c.DisplayName)  ID: $($c.ConnectorName)$label" -ForegroundColor $color
+                    }
+                    $inv.powerApps.myConnectors = @($myConnectors | ForEach-Object {
+                        [ordered]@{ displayName = $_.DisplayName; id = $_.ConnectorName; configured = ($_.DisplayName -eq $env:CONNECTOR_NAME) }
+                    })
+                } else {
+                    Write-Info "No connectors owned by $myUpn in this environment"
+                }
+            } else {
+                Write-Warn "Could not resolve environment from PPAC_ENVIRONMENT_URL"
+            }
+        } catch {
+            Write-Warn "Owner-filtered connector query failed: $($_.Exception.Message)"
+        }
+    } else {
+        Write-Info "User identity not resolved — skipping owner-filtered connector list"
+    }
+}
+
+# ── Copilot Studio Agents ─────────────────────────────────────────────────────
+Write-Section "Copilot Studio Agents"
+
+$inv.copilot.agentName  = $env:COPILOT_AGENT_NAME
+$inv.copilot.myAgents   = @()
+
+if (-not (Get-Command pac -ErrorAction SilentlyContinue)) {
+    Write-Warn "PAC CLI not found — skipping"
+} elseif (-not $env:PPAC_ENVIRONMENT_URL) {
+    Write-Missing "PPAC_ENVIRONMENT_URL not set"
+} else {
+    try {
+        $agentLines = pac copilot list --environment $env:PPAC_ENVIRONMENT_URL 2>&1
+        $guidRegex  = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+        $agentData  = $agentLines | Where-Object { $_ -match $guidRegex -and $_ -notmatch '^Connected' -and $_ -notmatch '^Microsoft' }
+
+        if ($agentData) {
+            foreach ($line in $agentData) {
+                $id   = ([regex]$guidRegex).Match($line).Value
+                $name = ($line -replace $guidRegex, '').Trim()
+                $isConfigured = ($env:COPILOT_AGENT_NAME -and $name -match [regex]::Escape($env:COPILOT_AGENT_NAME))
+                if ($isConfigured) {
+                    Write-Found "Agent: $name (ID: $id) (configured)"
+                } else {
+                    Write-Extra "Agent: $name (ID: $id) [other]"
+                }
+                $inv.copilot.myAgents += [ordered]@{ name = $name; id = $id; configured = $isConfigured }
+            }
+            if (-not ($inv.copilot.myAgents | Where-Object { $_.configured })) {
+                if ($env:COPILOT_AGENT_NAME) {
+                    Write-Missing "Configured agent '$($env:COPILOT_AGENT_NAME)' not found"
+                }
+            }
+        } else {
+            Write-Missing "No agents found in environment"
+        }
+    } catch {
+        Write-Warn "Copilot agent query failed: $($_.Exception.Message)"
+        $inv.copilot.error = $_.Exception.Message
     }
 }
 
@@ -313,7 +396,6 @@ if (-not $env:CLOUDFS_MASTER_NODE) {
 Write-Section "M365 Copilot"
 
 try {
-    # SP token may lack Organization.Read.All — reconnect interactively if needed
     $skus = $null
     try {
         $skus = Get-MgSubscribedSku -ErrorAction Stop
@@ -337,7 +419,6 @@ try {
         $inv.m365.licenses = @()
     }
 
-    # Graph connector state
     if ($env:NEXUS_AI_CONNECTOR_ID) {
         try {
             $conn = Invoke-MgGraphRequest -Method GET `
@@ -354,13 +435,12 @@ try {
         $inv.m365.graphConnector = [ordered]@{ found = $false; reason = "NEXUS_AI_CONNECTOR_ID not set" }
     }
 
-    # Broad search — any Graph external connections with panzura/nexus in name
     try {
-        $allConns = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/external/connections" -ErrorAction Stop
+        $allConns     = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/external/connections" -ErrorAction Stop
         $panzuraConns = $allConns.value | Where-Object { $_.name -match 'panzura|nexus' -or $_.id -match 'panzura|nexus' }
         if ($panzuraConns) {
             Write-Host ""
-            Write-Host "  Broad search — Graph external connections:" -ForegroundColor Cyan
+            Write-Host "  Graph external connections (panzura/nexus):" -ForegroundColor Cyan
             $inv.m365.allGraphConnectors = @($panzuraConns | ForEach-Object {
                 $isConfigured = ($_.id -eq $env:NEXUS_AI_CONNECTOR_ID)
                 $label = if ($isConfigured) { "(configured)" } else { "[other]" }
@@ -389,15 +469,11 @@ Write-Host ("═" * 50)
 Write-Host "Inventory written to: $outFile" -ForegroundColor Green
 Write-Host ""
 
-# Flag any unexpected resources
-$unexpected = @()
-$unexpected += $inv.broadSearch.entraApps              | Where-Object { -not $_.configured -and -not $_.knownSafe }
-$unexpected += $inv.broadSearch.entraServicePrincipals | Where-Object { -not $_.configured -and -not $_.knownSafe }
-$unexpected += $inv.powerApps.allConnectors            | Where-Object { $_.isPanzuraNexus -and -not $_.configured }
-$unexpected += $inv.m365.allGraphConnectors            | Where-Object { -not $_.configured }
+$otherCount = 0
+$otherCount += @($inv.broadSearch.entraApps              | Where-Object { -not $_.configured -and -not $_.knownSafe }).Count
+$otherCount += @($inv.broadSearch.entraServicePrincipals | Where-Object { -not $_.configured -and -not $_.knownSafe }).Count
+$otherCount += @($inv.m365.allGraphConnectors            | Where-Object { -not $_.configured }).Count
 
-if ($unexpected.Count -gt 0) {
-    Write-Host "$($unexpected.Count) other panzura/nexus resource(s) found in this environment (not ours) — see [XTRA] items above." -ForegroundColor DarkGray
-} else {
-    Write-Host "No other panzura/nexus resources found in this environment." -ForegroundColor DarkGray
+if ($otherCount -gt 0) {
+    Write-Host "$otherCount other panzura/nexus resource(s) in this environment (not ours) — see [XTRA] items above." -ForegroundColor DarkGray
 }
