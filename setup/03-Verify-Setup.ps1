@@ -138,15 +138,15 @@ Check "PAC CLI: authenticated to correct tenant" {
     $pacTenant = if ($envIdLine -match 'Default-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})') { $matches[1] } else { $null }
 
     if ($envTenantId -and $pacTenant -and $pacTenant -ne $envTenantId) {
-        throw "Wrong tenant — PAC CLI connected to $pacTenant but .env specifies $envTenantId`nFix: pac auth clear  then  pac auth create --tenant $envTenantId"
+        throw "Wrong tenant — PAC CLI connected to $pacTenant but .env specifies $envTenantId"
     }
 
     $userMatch  = $activeLine -match '(\S+@\S+)'
     $user       = if ($userMatch) { $matches[1] } else { "unknown" }
     $tenantNote = if ($pacTenant) { "tenant $pacTenant ✓" } else { "tenant unverifiable — proceeding" }
     "Connected as $user — $tenantNote"
-} -FixCmd "pac auth create --tenant $envTenantId" `
-  -FixNote "Sign in with your Global Admin account for the target tenant"
+} -FixCmd "pac auth clear; pac auth create --tenant $envTenantId" `
+  -FixNote "Or if PAC CLI tenant is correct: update ENTRA_TENANT_ID in .env to match"
 
 # ── PAC CLI can list commands (functional test) ───────────────────────────────
 Check "PAC CLI: connector command" {
@@ -189,24 +189,29 @@ if ($fail -gt 0) {
 
     if ($pacAuthFail -and -not $otherFails -and $envTenantId) {
         Write-Host ""
-        Write-Host "The only failure is PAC CLI authentication." -ForegroundColor Yellow
-        $answer = Read-Host "Fix it now? This will open a browser for tenant $envTenantId [Y/n]"
-        if ($answer -eq '' -or $answer -match '^[Yy]') {
-            Write-Host ""
-            # Clear any wrong-tenant session first
-            $authList  = pac auth list 2>&1
-            $hasTenant = $authList | Where-Object { $_ -match '([0-9a-f-]{36})' -and $_ -match 'Tenant' }
-            if ($hasTenant) { pac auth clear | Out-Null }
-            pac auth create --tenant $envTenantId
-            if ($LASTEXITCODE -eq 0) {
+        if ($pacAuthFail.Detail -match '^Wrong tenant') {
+            # Mismatch — could be wrong .env or wrong PAC CLI session; don't assume
+            Write-Host "Tenant mismatch — check which side is correct:" -ForegroundColor Yellow
+            Write-Host "  If .env is correct:        pac auth clear; pac auth create --tenant $envTenantId" -ForegroundColor White
+            Write-Host "  If PAC CLI is correct:     update ENTRA_TENANT_ID in .env to match the connected tenant" -ForegroundColor White
+        } else {
+            # Not authenticated at all — .env tenant is authoritative, just need to log in
+            Write-Host "The only failure is PAC CLI authentication." -ForegroundColor Yellow
+            $answer = Read-Host "Fix it now? This will open a browser for tenant $envTenantId [Y/n]"
+            if ($answer -eq '' -or $answer -match '^[Yy]') {
                 Write-Host ""
-                Write-Host "Authenticated. Re-running verification..." -ForegroundColor Green
-                Write-Host ""
-                & $PSCommandPath
-                exit $LASTEXITCODE
-            } else {
-                Write-Host "Authentication failed. Try manually: pac auth create --tenant $envTenantId" -ForegroundColor Red
-                exit 1
+                pac auth clear 2>&1 | Out-Null
+                pac auth create --tenant $envTenantId
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host ""
+                    Write-Host "Authenticated. Re-running verification..." -ForegroundColor Green
+                    Write-Host ""
+                    & $PSCommandPath
+                    exit $LASTEXITCODE
+                } else {
+                    Write-Host "Authentication failed. Try manually: pac auth create --tenant $envTenantId" -ForegroundColor Red
+                    exit 1
+                }
             }
         }
     }
