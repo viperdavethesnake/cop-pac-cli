@@ -23,8 +23,19 @@ $appDisplayName = $env:ENTRA_APP_NAME
 Connect-MgGraph -TenantId $env:ENTRA_TENANT_ID -Scopes "Application.ReadWrite.All" -NoWelcome
 
 # ── Register App ──────────────────────────────────────────────────────────────
-# TODO: Check if app already exists before creating
-$existingApp = Get-MgApplication -Filter "displayName eq '$appDisplayName'" -ErrorAction SilentlyContinue
+# On re-runs, look up by appId (exact) — only use displayName on genuine first run.
+# displayName is not unique in a shared tenant; multiple matches must fail loudly.
+$existingApp = $null
+if ($env:ENTRA_CLIENT_ID) {
+    $existingApp = Get-MgApplication -Filter "appId eq '$($env:ENTRA_CLIENT_ID)'" -ErrorAction SilentlyContinue
+}
+if (-not $existingApp) {
+    $candidates = @(Get-MgApplication -Filter "displayName eq '$appDisplayName'" -ErrorAction SilentlyContinue)
+    if ($candidates.Count -gt 1) {
+        throw "Multiple Entra apps found with displayName '$appDisplayName'. Set ENTRA_CLIENT_ID in .env to the correct appId and re-run."
+    }
+    $existingApp = $candidates | Select-Object -First 1
+}
 
 if ($existingApp) {
     Write-Host "App already registered: $($existingApp.DisplayName) (AppId: $($existingApp.AppId))" -ForegroundColor Yellow
