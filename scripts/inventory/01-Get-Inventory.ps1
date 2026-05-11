@@ -82,7 +82,8 @@ if (-not $graphConnected) {
         $ctx = Get-MgContext
         $myUpn = $ctx.Account
         if ($myUpn) {
-            $me = Get-MgUser -UserId $myUpn -Property Id,DisplayName,UserPrincipalName -ErrorAction SilentlyContinue
+            # Use "me" endpoint — avoids needing User.ReadBasic.All for UPN lookup
+            $me = Get-MgUser -UserId "me" -Property Id,DisplayName,UserPrincipalName -ErrorAction SilentlyContinue
             $myAadObjectId = $me?.Id
             Write-Found "Signed in as: $myUpn"
             Write-Info  "Entra Object ID: $myAadObjectId"
@@ -109,7 +110,11 @@ if (-not $graphConnected) {
     try {
         $app = $null
         if ($env:ENTRA_CLIENT_ID) {
+            # Try standard filter first; fall back to search if token lacks delegated Application.Read.All
             $app = Get-MgApplication -Filter "appId eq '$($env:ENTRA_CLIENT_ID)'" -ErrorAction SilentlyContinue
+            if (-not $app) {
+                $app = Get-MgApplication -Search "`"appId:$($env:ENTRA_CLIENT_ID)`"" -ConsistencyLevel eventual -ErrorAction SilentlyContinue | Select-Object -First 1
+            }
         }
 
         if ($app) {
@@ -313,7 +318,8 @@ if (-not (Get-Command pac -ErrorAction SilentlyContinue)) {
         if ($agentData) {
             foreach ($line in $agentData) {
                 $id   = ([regex]$guidRegex).Match($line).Value
-                $name = ($line -replace $guidRegex, '').Trim()
+                # pac copilot list outputs a multi-column table; take only the first column (name)
+                $name = ($line -split '\s{2,}')[0].Trim()
                 $isConfigured = ($env:COPILOT_AGENT_NAME -and $name -match [regex]::Escape($env:COPILOT_AGENT_NAME))
                 if ($isConfigured) {
                     Write-Found "Agent: $name (ID: $id) (configured)"
@@ -440,13 +446,17 @@ try {
         $panzuraConns = $allConns.value | Where-Object { $_.name -match 'panzura|nexus' -or $_.id -match 'panzura|nexus' }
         if ($panzuraConns) {
             Write-Host ""
+            $configuredConn = $panzuraConns | Where-Object { $_.id -eq $env:NEXUS_AI_CONNECTOR_ID }
+            $otherConns     = $panzuraConns | Where-Object { $_.id -ne $env:NEXUS_AI_CONNECTOR_ID }
             Write-Host "  Graph external connections (panzura/nexus):" -ForegroundColor Cyan
+            if ($configuredConn) {
+                Write-Host "    $($configuredConn.name)  id: $($configuredConn.id)  state: $($configuredConn.state)  (configured)" -ForegroundColor Green
+            }
+            if ($otherConns) {
+                Write-Info "  $($otherConns.Count) other panzura/nexus Graph connections in tenant (details in JSON)"
+            }
             $inv.m365.allGraphConnectors = @($panzuraConns | ForEach-Object {
-                $isConfigured = ($_.id -eq $env:NEXUS_AI_CONNECTOR_ID)
-                $label = if ($isConfigured) { "(configured)" } else { "[other]" }
-                $color = if ($isConfigured) { "Green" } else { "DarkGray" }
-                Write-Host "    $($_.name)  id: $($_.id)  state: $($_.state)  $label" -ForegroundColor $color
-                [ordered]@{ name = $_.name; id = $_.id; state = $_.state; configured = $isConfigured }
+                [ordered]@{ name = $_.name; id = $_.id; state = $_.state; configured = ($_.id -eq $env:NEXUS_AI_CONNECTOR_ID) }
             })
         } else {
             $inv.m365.allGraphConnectors = @()
