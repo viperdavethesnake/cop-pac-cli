@@ -100,14 +100,53 @@ foreach ($mod in $requiredModules) {
     } -FixCmd "pwsh setup/02-Install-PSModules.ps1"
 }
 
-# ── .env file ─────────────────────────────────────────────────────────────────
-$envPath = Join-Path $PSScriptRoot "../.env"
-if (Test-Path $envPath) {
-    Check ".env file exists" { ".env found at $envPath ✓" }
-} else {
-    Warn ".env file" ".env not found — project scripts will not run" `
-        "cp .env.example .env  then fill in values"
-}
+# ── .env Stage 1 keys ─────────────────────────────────────────────────────────
+$envPath     = Join-Path $PSScriptRoot "../.env"
+$envTenantId = $null
+
+Check ".env Stage 1 keys" {
+    if (-not (Test-Path $envPath)) {
+        throw ".env not found — run: cp .env.example .env  then fill in Stage 1 values"
+    }
+    $envVals = @{}
+    Get-Content $envPath | Where-Object { $_ -match '^[^#].*=' } | ForEach-Object {
+        $parts = $_ -split '=', 2
+        $envVals[$parts[0].Trim()] = ($parts[1] -replace '\s*#.*$', '').Trim()
+    }
+    $required = @('ENTRA_TENANT_ID', 'ENTRA_APP_NAME', 'CONNECTOR_NAME')
+    $missing  = $required | Where-Object { -not $envVals[$_] }
+    if ($missing) {
+        throw "Missing required values in .env: $($missing -join ', ')"
+    }
+    $script:envTenantId = $envVals['ENTRA_TENANT_ID']
+    "ENTRA_TENANT_ID, ENTRA_APP_NAME, CONNECTOR_NAME all set ✓"
+} -FixCmd "cp .env.example .env" -FixNote "Then fill in: ENTRA_TENANT_ID, ENTRA_APP_NAME, CONNECTOR_NAME"
+
+# ── PAC CLI authentication ────────────────────────────────────────────────────
+Check "PAC CLI: authenticated to correct tenant" {
+    # Use pac auth list to check for active profile — more reliable than pac org who exit code
+    $authList   = pac auth list 2>&1
+    $activeLine = $authList | Where-Object { $_ -match '^\[?\d+\]?\s+\*' -or $_ -match '^\s*\*' } | Select-Object -First 1
+    if (-not $activeLine) {
+        $tid = if ($envTenantId) { $envTenantId } else { "<fill ENTRA_TENANT_ID in .env first>" }
+        throw "Not authenticated — run: pac auth create --tenant $tid"
+    }
+
+    # Use pac org who to extract tenant from Environment ID line
+    $who       = pac org who 2>&1
+    $envIdLine = $who | Where-Object { $_ -match 'Environment ID' } | Select-Object -First 1
+    $pacTenant = if ($envIdLine -match 'Default-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})') { $matches[1] } else { $null }
+
+    if ($envTenantId -and $pacTenant -and $pacTenant -ne $envTenantId) {
+        throw "Wrong tenant — PAC CLI connected to $pacTenant but .env specifies $envTenantId`nFix: pac auth clear  then  pac auth create --tenant $envTenantId"
+    }
+
+    $userMatch  = $activeLine -match '(\S+@\S+)'
+    $user       = if ($userMatch) { $matches[1] } else { "unknown" }
+    $tenantNote = if ($pacTenant) { "tenant $pacTenant ✓" } else { "tenant unverifiable — proceeding" }
+    "Connected as $user — $tenantNote"
+} -FixCmd "pac auth create --tenant $envTenantId" `
+  -FixNote "Sign in with your Global Admin account for the target tenant"
 
 # ── PAC CLI can list commands (functional test) ───────────────────────────────
 Check "PAC CLI: connector command" {
@@ -144,6 +183,34 @@ $statusColor = if ($fail -gt 0) { "Red" } elseif ($warn -gt 0) { "Yellow" } else
 Write-Host "Results: $pass PASS  |  $warn WARN  |  $fail FAIL" -ForegroundColor $statusColor
 
 if ($fail -gt 0) {
+    # If the only failure is PAC CLI auth and we have a tenant ID, offer to fix it now
+    $pacAuthFail = $results | Where-Object { $_.Status -eq "FAIL" -and $_.Label -like "PAC CLI: authenticated*" }
+    $otherFails  = $results | Where-Object { $_.Status -eq "FAIL" -and $_.Label -notlike "PAC CLI: authenticated*" }
+
+    if ($pacAuthFail -and -not $otherFails -and $envTenantId) {
+        Write-Host ""
+        Write-Host "The only failure is PAC CLI authentication." -ForegroundColor Yellow
+        $answer = Read-Host "Fix it now? This will open a browser for tenant $envTenantId [Y/n]"
+        if ($answer -eq '' -or $answer -match '^[Yy]') {
+            Write-Host ""
+            # Clear any wrong-tenant session first
+            $authList  = pac auth list 2>&1
+            $hasTenant = $authList | Where-Object { $_ -match '([0-9a-f-]{36})' -and $_ -match 'Tenant' }
+            if ($hasTenant) { pac auth clear | Out-Null }
+            pac auth create --tenant $envTenantId
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host ""
+                Write-Host "Authenticated. Re-running verification..." -ForegroundColor Green
+                Write-Host ""
+                & $PSCommandPath
+                exit $LASTEXITCODE
+            } else {
+                Write-Host "Authentication failed. Try manually: pac auth create --tenant $envTenantId" -ForegroundColor Red
+                exit 1
+            }
+        }
+    }
+
     Write-Host ""
     Write-Host "Fix the FAIL items above, then re-run this script." -ForegroundColor Red
     Write-Host "See setup/README.md for troubleshooting details." -ForegroundColor DarkGray
@@ -152,6 +219,5 @@ if ($fail -gt 0) {
     Write-Host ""
     Write-Host "Environment is ready." -ForegroundColor Green
     Write-Host ""
-    Write-Host "Next: copy .env.example to .env and fill in your credentials." -ForegroundColor Cyan
-    Write-Host "Then run: pwsh scripts/entra/00-Validate-Prerequisites.ps1"
+    Write-Host "Run next: pwsh scripts/entra/00-Validate-Prerequisites.ps1" -ForegroundColor Cyan
 }

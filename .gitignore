@@ -1,0 +1,15 @@
+# Secrets — never commit
+.env
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Inventory snapshots — local only, contain tenant data
+inventory/
+
+# Claude local settings
+.claude/
+
+# Large binaries
+*.pdf
