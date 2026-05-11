@@ -1,0 +1,496 @@
+swagger: '2.0'
+info:
+  title: panzura-nexus-conn-schema-v03
+  description: Retrieve results from Panzura CloudFS
+  version: '1.0'
+x-ms-connector-metadata:
+  - propertyName: Website
+    propertyValue: https://panzura.com
+  - propertyName: Privacy policy
+    propertyValue: https://panzura.com/privacy-policy
+  - propertyName: Categories
+    propertyValue: Standard
+  - propertyName: iconBackground
+    propertyValue: '#40E0D0'
+host: graph.microsoft.com
+basePath: /
+schemes:
+  - https
+consumes:
+  - application/json
+produces:
+  - application/json
+paths:
+  /v1.0/search/query:
+    post:
+      operationId: SearchNexus
+      summary: Search Nexus Data
+      description: Retrieve results from Panzura CloudFS
+      parameters:
+        - name: body
+          in: body
+          required: true
+          schema:
+            $ref: '#/definitions/SearchRequest'
+          x-ms-description: Search query parameters
+          x-ms-summary: Search Request
+      responses:
+        '200':
+          description: Success
+          schema:
+            type: object
+            properties:
+              value:
+                description: value
+                type: array
+                items:
+                  type: object
+                  properties:
+                    searchTerms:
+                      description: searchTerms
+                      type: array
+                      items:
+                        type: string
+                    hitsContainers:
+                      description: hitsContainers
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          hits:
+                            description: hits
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                hitId:
+                                  description: hitId
+                                  type: string
+                                contentSource:
+                                  description: contentSource
+                                  type: string
+                                rank:
+                                  description: rank
+                                  type: integer
+                                  format: int32
+                                summary:
+                                  description: summary
+                                  type: string
+                                resource:
+                                  description: resource
+                                  type: object
+                                  properties:
+                                    '@odata.type':
+                                      description: '@odata.type'
+                                      type: string
+                                      x-ms-client-name: odataType
+                                    properties:
+                                      description: properties
+                                      type: object
+                                      properties:
+                                        documentId:
+                                          type: integer
+                                          format: int32
+                                          description: documentId
+                                        fileID:
+                                          type: string
+                                          description: fileID
+                                        hitHighlightedProperties:
+                                          type: string
+                                          description: hitHighlightedProperties
+                                        id:
+                                          type: string
+                                          description: id
+                                        immutableEntryId:
+                                          type: string
+                                          description: immutableEntryId
+                                        label_FileExtension:
+                                          type: string
+                                          description: label_FileExtension
+                                        label_FileName:
+                                          type: string
+                                          description: label_FileName
+                                        label_LastModifiedBy:
+                                          type: string
+                                          description: label_LastModifiedBy
+                                        label_LastModifiedDateTime:
+                                          type: string
+                                          description: label_LastModifiedDateTime
+                                        label_Title:
+                                          type: string
+                                          description: label_Title
+                                        label_URL:
+                                          type: string
+                                          description: label_URL
+                                        owner:
+                                          type: string
+                                          description: owner
+                                        path:
+                                          type: string
+                                          description: path
+                                        substrateLocationId:
+                                          type: string
+                                          description: substrateLocationId
+                                        url:
+                                          type: string
+                                          description: url
+                          total:
+                            description: total
+                            type: integer
+                            format: int32
+                          moreResultsAvailable:
+                            description: moreResultsAvailable
+                            type: boolean
+              '@odata.context':
+                description: '@odata.context'
+                type: string
+                x-ms-client-name: odataContext
+          x-ms-examples:
+            application/json:
+              value:
+                value: []
+                '@odata.context': https://graph.microsoft.com/v1.0/$metadata#search
+        '400':
+          description: Bad Request
+        default:
+          description: Error
+      consumes:
+        - application/json
+      produces:
+        - application/json
+      x-ms-description: Retrieve results from Panzura CloudFS
+      x-ms-examples:
+        application/json:
+          value:
+            query: query string
+            filter: ''
+            size: 50
+            offset: 0
+            contentSource: /external/connections/nexus
+      x-ms-summary: Search Nexus Data
+      x-ms-visibility: important
+  /v1.0/external/connections/{connection-id}/items/{item-id}:
+    get:
+      operationId: GetExternalItem
+      summary: Get External Item In Chunks
+      description: >-
+        Retrieve an external item in chunks to handle large files. Each call
+        returns a portion of the content.
+      parameters:
+        - name: connection-id
+          in: path
+          description: The ID of the external connection
+          required: true
+          type: string
+          x-ms-summary: Connection ID
+          x-ms-visibility: important
+        - name: item-id
+          in: path
+          description: The ID of the external item
+          required: true
+          type: string
+          x-ms-summary: Item ID
+          x-ms-visibility: important
+        - name: chunk
+          in: query
+          description: >-
+            The chunk index to retrieve (0-based). Required for chunked
+            retrieval.
+          required: true
+          type: integer
+          format: int32
+          minimum: 0
+          default: 0
+          x-ms-summary: Chunk Index
+          x-ms-visibility: important
+        - name: chunkSize
+          in: query
+          description: >-
+            Size of each chunk in bytes. Default is 76800 (75KB). Minimum 1024,
+            maximum 10485760 (10MB).
+          required: false
+          type: integer
+          format: int32
+          minimum: 1024
+          maximum: 10485760
+          default: 76800
+          x-ms-summary: Chunk Size (bytes)
+          x-ms-visibility: advanced
+        - name: useChunking
+          in: query
+          description: >-
+            Enable or disable chunking. When false, returns full item like the
+            non-chunked endpoint.
+          required: false
+          type: boolean
+          default: true
+          x-ms-summary: Enable Chunking
+          x-ms-visibility: advanced
+        - name: $select
+          in: query
+          description: OData $select query parameter to specify properties to return
+          required: false
+          type: string
+          x-ms-summary: Select Properties
+          x-ms-visibility: advanced
+      responses:
+        '200':
+          description: Success - Returns a chunk of the external item
+          headers:
+            X-Item-Chunk-Index:
+              type: integer
+              format: int32
+              description: The chunk index returned
+            X-Item-Total-Chunks:
+              type: integer
+              format: int32
+              description: Total number of chunks available
+            X-Item-Is-Last-Chunk:
+              type: boolean
+              description: Whether this is the last chunk
+            X-Item-Chunk-Size:
+              type: integer
+              format: int32
+              description: Size of this chunk in bytes
+            X-Item-Total-Size:
+              type: integer
+              format: int32
+              description: Total size of the content in bytes
+          schema:
+            $ref: '#/definitions/ChunkedExternalItemResponse'
+          x-ms-examples:
+            application/json:
+              value:
+                id: '12345'
+                properties:
+                  fileExtension: .pdf
+                  fileName: doc.pdf
+                  fileSize: 1024000
+                  lastModifiedDateTime: '2024-01-15T10:30:00Z'
+                  owner: john.doe@example.com
+                  path: /documents/doc.pdf
+                  title: Large Document
+                  url: https://example.com/doc.pdf
+                acl:
+                  - type: user
+                    value: john.doe@example.com
+                    accessType: grant
+                content:
+                  type: text
+                  value: First 75000 of the document content...
+                  isPartial: true
+                  chunkInfo:
+                    startByte: 0
+                    endByte: 102399
+                    chunkIndex: 0
+                    totalChunks: 10
+                    charsInChunk: 75000
+                chunkMetadata:
+                  chunkIndex: 0
+                  chunkSize: 76800
+                  totalChunks: 14
+                  isLastChunk: false
+                  chunkingEnabled: true
+                  totalSizeBytes: 1024000
+                  originalContentLength: 1250000
+                '@odata.type': '#microsoft.graph.externalItem'
+        '400':
+          description: Bad Request - Invalid chunk parameters
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  code:
+                    type: string
+                    enum:
+                      - InvalidChunkIndex
+                      - InvalidChunkSize
+                  message:
+                    type: string
+        '404':
+          description: Item not found
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        default:
+          description: Error
+      x-ms-description: >-
+        Retrieve large external items in manageable chunks to avoid size
+        limitations
+      x-ms-summary: Get External Item In Chunks
+      x-ms-visibility: important
+definitions:
+  SearchRequest:
+    type: object
+    required:
+      - query
+    properties:
+      query:
+        description: query string
+        type: string
+        x-ms-visibility: important
+      filter:
+        description: Key:value pair composed with and-or conditions
+        type: string
+        default: ''
+      size:
+        description: size
+        type: integer
+        format: int32
+        default: 50
+      offset:
+        description: offset
+        type: integer
+        format: int32
+        default: 0
+      contentSource:
+        description: external content source
+        type: string
+        default: /external/connections/nexus
+    example:
+      query: query string
+      filter: ''
+      size: 50
+      offset: 0
+      contentSource: /external/connections/nexus
+  ChunkedExternalItemResponse:
+    type: object
+    properties:
+      id:
+        description: The unique identifier of the item
+        type: string
+      properties:
+        description: The properties of the external item
+        type: object
+        additionalProperties: true
+      acl:
+        description: Access control list for the item
+        type: array
+        items:
+          type: object
+          properties:
+            type:
+              type: string
+              enum:
+                - user
+                - group
+                - everyone
+            value:
+              type: string
+            accessType:
+              type: string
+              enum:
+                - grant
+                - deny
+      content:
+        description: Chunked content of the external item
+        type: object
+        properties:
+          type:
+            type: string
+            description: Content type (e.g., text, html)
+          value:
+            type: string
+            description: The chunked content value
+          isPartial:
+            type: boolean
+            description: Indicates if this is a partial content chunk
+          chunkInfo:
+            type: object
+            properties:
+              startByte:
+                type: integer
+                format: int32
+                description: Starting byte position of this chunk
+              endByte:
+                type: integer
+                format: int32
+                description: Ending byte position of this chunk
+              chunkIndex:
+                type: integer
+                format: int32
+                description: The index of this chunk (0-based)
+              totalChunks:
+                type: integer
+                format: int32
+                description: Total number of chunks
+              charsInChunk:
+                type: integer
+                format: int32
+                description: Number of characters in this chunk
+      activities:
+        description: Activities associated with the item
+        type: array
+        items:
+          type: object
+      chunkMetadata:
+        description: Metadata about the chunking operation
+        type: object
+        properties:
+          chunkIndex:
+            type: integer
+            format: int32
+            description: The chunk index returned
+          chunkSize:
+            type: integer
+            format: int32
+            description: Size of each chunk in bytes
+          totalChunks:
+            type: integer
+            format: int32
+            description: Total number of chunks
+          isLastChunk:
+            type: boolean
+            description: Whether this is the last chunk
+          chunkingEnabled:
+            type: boolean
+            description: Whether chunking is enabled
+          totalSizeBytes:
+            type: integer
+            format: int32
+            description: Total size of the content in bytes
+          originalContentLength:
+            type: integer
+            format: int32
+            description: Original content length in characters
+      '@odata.type':
+        description: OData type
+        type: string
+        x-ms-client-name: odataType
+      '@odata.context':
+        description: OData context
+        type: string
+        x-ms-client-name: odataContext
+x-ms-capabilities:
+  supportsPaging: false
+  supportsRangeHeader: false
+  actions:
+    - SearchNexus
+    - GetExternalItem
+  triggers: []
+parameters: {}
+responses: {}
+security:
+  - oauth2-auth:
+      - User.Read Files.Read Sites.Read.All
+      - ExternalItem.Read.All
+tags: []
+securityDefinitions:
+  oauth2-auth:
+    type: oauth2
+    flow: accessCode
+    tokenUrl: https://login.windows.net/common/oauth2/authorize
+    scopes:
+      User.Read Files.Read Sites.Read.All: User.Read Files.Read Sites.Read.All
+      ExternalItem.Read.All: ExternalItem.Read.All
+    authorizationUrl: https://login.microsoftonline.com/common/oauth2/authorize
+

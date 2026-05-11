@@ -1,0 +1,96 @@
+# Architecture Overview
+
+## Component Map
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  On-Premises                                                             │
+│                                                                          │
+│  ┌──────────────┐   SMB (10Gbps LAN)   ┌───────────────────────────┐   │
+│  │   CloudFS    │◄────────────────────►│     Panzura Nexus VM      │   │
+│  │  (ring/nodes)│                      │  (Ubuntu, 16c/64GB/4TB)   │   │
+│  └──────────────┘                      └────────────┬──────────────┘   │
+│         ▲                                           │                   │
+│         │ file events (RabbitMQ 5671/5672)          │ REST API (443)    │
+│         └───────────────────────────────────────────┘                   │
+│                                                                          │
+│  ┌──────────────────────┐                                               │
+│  │  Active Directory    │  LDAP/LDAPS (389/636)                        │
+│  │  (on-prem)           │◄────────────────────────── Nexus             │
+│  └──────────┬───────────┘                                               │
+│             │                                                            │
+└─────────────┼───────────────────────────────────────────────────────────┘
+              │ Entra Connect V2 sync
+              ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Microsoft Cloud                                                         │
+│                                                                          │
+│  ┌───────────────────┐     ┌────────────────────────────────────────┐  │
+│  │  Microsoft Entra  │     │   Microsoft Graph                      │  │
+│  │  ID (Entra ID)    │     │   ┌──────────────────────────────────┐ │  │
+│  │                   │     │   │  External Connection (Connector)  │ │  │
+│  │  ┌─────────────┐  │     │   │  name: Panzura-Nexus-<policy-id> │ │  │
+│  │  │  App Reg    │──┼─────┼──►│  (created when policy activates) │ │  │
+│  │  │  (Nexus)    │  │     │   └──────────────────────────────────┘ │  │
+│  │  └─────────────┘  │     └────────────────────────────────────────┘  │
+│  └───────────────────┘                         │                        │
+│                                                 │ indexes content        │
+│  ┌──────────────────────────────────────────────▼────────────────────┐  │
+│  │  Microsoft 365 Copilot                                            │  │
+│  │  ┌──────────────────────────────────────────────────────────────┐ │  │
+│  │  │  Copilot Studio Agent                                        │ │  │
+│  │  │  ┌─────────────────┐   ┌──────────────────────────────────┐ │ │  │
+│  │  │  │  SearchNexus    │   │  GetExternalItem (chunked)       │ │ │  │
+│  │  │  │  (Graph search  │   │  (retrieves full file content)   │ │ │  │
+│  │  │  │   /query API)   │   └──────────────────────────────────┘ │ │  │
+│  │  │  └─────────────────┘                                         │ │  │
+│  │  │       Custom Connector (Power Apps) — OAuth2 → Graph API     │ │  │
+│  │  └──────────────────────────────────────────────────────────────┘ │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  ┌──────────────────────┐                                               │
+│  │  Power Platform      │                                               │
+│  │  Admin Center        │  Service principal for Nexus agent creation   │
+│  └──────────────────────┘                                               │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Data Flow
+
+1. **File event** occurs on CloudFS (create, rename, delete, ACL change)
+2. CloudFS audit system sends event to **Nexus** via RabbitMQ (ports 5671/5672)
+3. Nexus evaluates the event against active **policy rules** (file type, path, size, etc.)
+4. If the event matches, Nexus reads the file content + metadata via **SMB**
+5. Nexus resolves the file's ACL against **on-prem AD**, then maps those identities to **Entra ID**
+6. Nexus pushes the file content + resolved ACLs to the **Microsoft Graph External Connection** (connector)
+7. Microsoft Graph indexes the content and makes it available to **Copilot**
+8. Users chat with the **Copilot Studio agent**, which queries the connector via the Custom Connector and Graph search API
+9. Copilot enforces the original ACLs — users only see files they have permission to in CloudFS
+
+---
+
+## Key Design Constraints
+
+| Constraint | Why |
+|---|---|
+| Nexus must be on same LAN as CloudFS node | SMB read access requires 10Gbps LAN — no WAN SMB |
+| One Storage Plugin per CloudFS ring | Multiple plugins from same ring = policies stuck in "Activating" |
+| Connector name must not be modified | Modifying `Panzura-Nexus-<policy-id>` in M365 breaks the connector permanently |
+| Client secret max 2 years | Entra client secrets expire — calendar reminder needed |
+| System Administrator role in PPAC required | Nexus uses this to call Power Platform APIs for agent creation |
+| Live Access Monitoring should be off during full scans | Live events take priority and will stall scan jobs |
+
+---
+
+## Port Reference
+
+| Port | Protocol | Direction | Purpose |
+|---|---|---|---|
+| 443 | TCP | Inbound to Nexus | Admin web UI |
+| 5671 | TCP | Inbound to Nexus | RabbitMQ (CloudFS events, TLS) |
+| 5672 | TCP | Inbound to Nexus | RabbitMQ (CloudFS events) |
+| 22 | TCP | Inbound to Nexus | SSH from CloudFS node |
+| 389 | TCP | Outbound from Nexus | LDAP to AD |
+| 636 | TCP | Outbound from Nexus | LDAPS to AD |
