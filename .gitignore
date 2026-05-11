@@ -6,7 +6,7 @@
 **/.DS_Store
 
 # Inventory snapshots — local only, contain tenant data
-inventory/
+/inventory/
 
 # Claude local settings
 .claude/

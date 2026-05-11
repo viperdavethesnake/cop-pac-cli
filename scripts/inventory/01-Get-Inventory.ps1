@@ -52,13 +52,19 @@ try {
             (ConvertTo-SecureString $env:ENTRA_CLIENT_SECRET -AsPlainText -Force)
         )
         Connect-MgGraph -TenantId $env:ENTRA_TENANT_ID -ClientSecretCredential $cred -NoWelcome -ErrorAction Stop
-    } else {
-        Connect-MgGraph -TenantId $env:ENTRA_TENANT_ID -Scopes "Application.Read.All","Directory.Read.All","Organization.Read.All" -NoWelcome -ErrorAction Stop
+        $graphConnected = $true
     }
-    $graphConnected = $true
 } catch {
     Write-Host ""
-    Write-Warn "Graph connection failed: $($_.Exception.Message)"
+    Write-Warn "Client-secret Graph auth failed — falling back to interactive login"
+}
+if (-not $graphConnected) {
+    try {
+        Connect-MgGraph -TenantId $env:ENTRA_TENANT_ID -Scopes "Application.Read.All","Directory.Read.All","Organization.Read.All" -NoWelcome -ErrorAction Stop
+        $graphConnected = $true
+    } catch {
+        Write-Warn "Graph connection failed: $($_.Exception.Message)"
+    }
 }
 
 # ── Entra ID — configured app ─────────────────────────────────────────────────
@@ -145,7 +151,7 @@ if (-not $graphConnected) {
                 $seenAppIds[$r.AppId] = $true
                 $isConfigured = ($r.AppId -eq $env:ENTRA_CLIENT_ID)
                 $isSafe       = Test-KnownSafe $r.DisplayName
-                $label = if ($isConfigured) { "(configured)" } elseif ($isSafe) { "(known-safe: Microsoft-managed)" } else { "[UNEXPECTED]" }
+                $label = if ($isConfigured) { "(configured)" } elseif ($isSafe) { "(known-safe: Microsoft-managed)" } else { "[other]" }
                 $color = if ($isConfigured) { "Green" } elseif ($isSafe) { "DarkGray" } else { "Magenta" }
                 Write-Host "  [APP]  $($r.DisplayName)  AppId: $($r.AppId)  $label" -ForegroundColor $color
                 $inv.broadSearch.entraApps += [ordered]@{
@@ -168,7 +174,7 @@ if (-not $graphConnected) {
                 $seenSpIds[$r.AppId] = $true
                 $isConfigured = ($r.AppId -eq $env:ENTRA_CLIENT_ID)
                 $isSafe       = Test-KnownSafe $r.DisplayName
-                $label = if ($isConfigured) { "(configured)" } elseif ($isSafe) { "(known-safe: Microsoft-managed)" } else { "[UNEXPECTED]" }
+                $label = if ($isConfigured) { "(configured)" } elseif ($isSafe) { "(known-safe: Microsoft-managed)" } else { "[other]" }
                 $color = if ($isConfigured) { "Green" } elseif ($isSafe) { "DarkGray" } else { "Magenta" }
                 Write-Host "  [SP]   $($r.DisplayName)  AppId: $($r.AppId)  Type: $($r.ServicePrincipalType)  $label" -ForegroundColor $color
                 $inv.broadSearch.entraServicePrincipals += [ordered]@{
@@ -220,7 +226,7 @@ if (-not (Get-Command pac -ErrorAction SilentlyContinue)) {
             if ($isConfigured) {
                 Write-Found "Connector: $name (ID: $id) (configured)"
             } elseif ($isPanzuraNexus) {
-                Write-Extra "Connector: $name (ID: $id) [UNEXPECTED — matches panzura/nexus]"
+                Write-Extra "Connector: $name (ID: $id) [other — not ours]"
             }
 
             $inv.powerApps.allConnectors += [ordered]@{
@@ -357,8 +363,8 @@ try {
             Write-Host "  Broad search — Graph external connections:" -ForegroundColor Cyan
             $inv.m365.allGraphConnectors = @($panzuraConns | ForEach-Object {
                 $isConfigured = ($_.id -eq $env:NEXUS_AI_CONNECTOR_ID)
-                $label = if ($isConfigured) { "(configured)" } else { "[UNEXPECTED]" }
-                $color = if ($isConfigured) { "Green" } else { "Magenta" }
+                $label = if ($isConfigured) { "(configured)" } else { "[other]" }
+                $color = if ($isConfigured) { "Green" } else { "DarkGray" }
                 Write-Host "    $($_.name)  id: $($_.id)  state: $($_.state)  $label" -ForegroundColor $color
                 [ordered]@{ name = $_.name; id = $_.id; state = $_.state; configured = $isConfigured }
             })
@@ -391,7 +397,7 @@ $unexpected += $inv.powerApps.allConnectors            | Where-Object { $_.isPan
 $unexpected += $inv.m365.allGraphConnectors            | Where-Object { -not $_.configured }
 
 if ($unexpected.Count -gt 0) {
-    Write-Host "$($unexpected.Count) unexpected panzura/nexus resource(s) found — review [XTRA] items above." -ForegroundColor Magenta
+    Write-Host "$($unexpected.Count) other panzura/nexus resource(s) found in this environment (not ours) — see [XTRA] items above." -ForegroundColor DarkGray
 } else {
-    Write-Host "No unexpected panzura/nexus resources found." -ForegroundColor DarkGray
+    Write-Host "No other panzura/nexus resources found in this environment." -ForegroundColor DarkGray
 }
