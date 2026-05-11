@@ -55,14 +55,12 @@ if (-not (Get-Command pac -ErrorAction SilentlyContinue)) {
         $connectorList = pac connector list --environment $env:PPAC_ENVIRONMENT_URL 2>&1
         $guidRegex     = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 
-        # Match by CONNECTOR_NAME first, then fall back to any panzura/nexus line
+        # Match only our connector by exact name — never fall back to a pattern
+        # in a shared environment that would match another user's connector
         $connectorLine = $connectorList | Where-Object { $_ -match [regex]::Escape($env:CONNECTOR_NAME) } | Select-Object -First 1
-        if (-not $connectorLine) {
-            $connectorLine = $connectorList | Where-Object { $_ -match 'panzura|nexus' -and $_ -match $guidRegex } | Select-Object -First 1
-        }
 
         if (-not $connectorLine) {
-            Write-Skip "No panzura/nexus connector found in environment"
+            Write-Skip "Connector '$($env:CONNECTOR_NAME)' not found in environment — already deleted or never created"
         } else {
             $connectorId   = ([regex]$guidRegex).Match($connectorLine).Value
             $connectorName = ($connectorLine.Trim() -split '\s+')[0]
@@ -107,13 +105,12 @@ try {
     exit 1
 }
 
-# Find the app
+# Find the app by appId only — displayName is not unique in a shared tenant
 $app = $null
 if ($env:ENTRA_CLIENT_ID) {
     $app = Get-MgApplication -Filter "appId eq '$($env:ENTRA_CLIENT_ID)'" -ErrorAction SilentlyContinue
-}
-if (-not $app) {
-    $app = Get-MgApplication -Filter "displayName eq '$($env:ENTRA_APP_NAME)'" -ErrorAction SilentlyContinue | Select-Object -First 1
+} else {
+    Write-Host "  ENTRA_CLIENT_ID not set — cannot locate app safely. Set it in .env and re-run." -ForegroundColor Yellow
 }
 
 # ── Step 2: Remove redirect URI ───────────────────────────────────────────────
@@ -159,17 +156,14 @@ if (-not $app) {
 Write-Step "Step 4 — Purge app from Entra soft-delete (skips 30-day hold)"
 
 try {
-    # Soft-deleted apps appear as microsoft.graph.application in the deleted items list
-    $deletedApps = Get-MgDirectoryDeletedItem -DirectoryObjectId " " -ErrorAction SilentlyContinue 2>$null
-    # Query by app name
-    $deletedApp = Get-MgDirectoryDeletedItemAsApplication -Filter "displayName eq '$($env:ENTRA_APP_NAME)'" -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-
-    if (-not $deletedApp) {
-        # May take a few seconds to appear — try once more
-        Start-Sleep -Seconds 5
-        $deletedApp = Get-MgDirectoryDeletedItemAsApplication -Filter "displayName eq '$($env:ENTRA_APP_NAME)'" -ErrorAction SilentlyContinue |
-            Select-Object -First 1
+    # Use the Object ID from Step 3 — avoids displayName collisions in shared tenants
+    $deletedApp = $null
+    if ($appId) {
+        $deletedApp = Get-MgDirectoryDeletedItemAsApplication -DirectoryObjectId $appId -ErrorAction SilentlyContinue
+        if (-not $deletedApp) {
+            Start-Sleep -Seconds 5
+            $deletedApp = Get-MgDirectoryDeletedItemAsApplication -DirectoryObjectId $appId -ErrorAction SilentlyContinue
+        }
     }
 
     if ($deletedApp) {

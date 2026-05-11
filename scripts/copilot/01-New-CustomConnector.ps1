@@ -214,11 +214,9 @@ $existingConnectors = pac connector list --environment $envUrl 2>&1
 $existingId = $null
 if ($existingConnectors) {
     $guidRegex = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-    # Only match our connector — filter by name first, then panzura/nexus pattern
+    # Match only our connector by exact display name — never fall back to a pattern
+    # in a shared environment that would grab another user's connector
     $existingLine = $existingConnectors | Where-Object { $_ -match [regex]::Escape($env:CONNECTOR_NAME) } | Select-Object -First 1
-    if (-not $existingLine) {
-        $existingLine = $existingConnectors | Where-Object { $_ -match 'panzura|nexus' -and $_ -match $guidRegex } | Select-Object -First 1
-    }
     if ($existingLine) {
         $existingId = ([regex]$guidRegex).Match($existingLine).Value
     }
