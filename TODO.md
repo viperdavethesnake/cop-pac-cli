@@ -1,6 +1,6 @@
 # Nexus Automation — TODO List
 
-Last updated: 2026-05-05
+Last updated: 2026-05-11
 
 ---
 
@@ -16,7 +16,7 @@ These cannot be done until Nexus and CloudFS VMs are deployed.
 
 - [x] **Test entra/00–03 end to end** — Tested live 2026-05-06. All passed. 4 bugs found and fixed (see project_entra_tested.md). Verify portal shows all 11 permissions granted.
 
-- [ ] **Test copilot/01** — Run `pac auth create` against the Power Platform environment, then run the custom connector script. Verify connector appears in make.powerapps.com.
+- [x] **Test copilot/01** — Tested live 2026-05-11. Connector created, OAuth connection established, GetExternalItem HTTP 200. Three bugs found and fixed: (1) swagger `info.title` not patched with CONNECTOR_NAME → connector created with wrong display name; (2) Power Platform now uses per-connector redirect URI, not generic `global.consent.azure-apim.net/redirect` — script now downloads connector post-create and reads actual `redirectUrl` from `apiProperties.json`; (3) driveItem search fails with app-only auth (Microsoft limitation) — smoke test now skips until NEXUS_AI_CONNECTOR_ID is set.
 
 ---
 
@@ -51,7 +51,7 @@ These cannot be done until Nexus and CloudFS VMs are deployed.
 
 - [ ] **VM deployment scripts** — Azure and Hyper-V deployment are documented in `docs/03` and `docs/04` but not scripted. Steps are straightforward; defer until needed.
 
-- [ ] **`copilot/01` — PAC CLI output parsing** — The script tries to extract a connector GUID from `pac connector create` output. PAC CLI output format is not documented; the regex may not match. Low impact (cosmetic only — connector is created regardless).
+- [x] **`copilot/01` — PAC CLI output parsing** — Confirmed working live 2026-05-11. GUID regex correctly extracts connector ID from `pac connector create` output. Used for post-create download to read redirect URI.
 
 - [ ] **`m365/01` — Monitor beta API promotion** — The `enabledContentExperiences` property with `copilotSearch` is beta-only and undocumented. Watch for Microsoft to promote this to v1.0 or officially document the enum. See `docs/ms-reference/graph-external-connection-update.md`.
 
@@ -70,7 +70,7 @@ These cannot be done until Nexus and CloudFS VMs are deployed.
 - [x] `m365/01` — beta API + portal fallback for connector visibility
 - [x] `m365/02` — Copilot license report
 - [x] `m365/03` — connector health check
-- [x] `copilot/01` — PAC CLI connector creation, dynamic apiProperties.json, Entra redirect URI update
+- [x] `copilot/01` — PAC CLI connector creation, dynamic apiProperties.json, per-connector redirect URI auto-detected + added to Entra app, smoke test fixed — **tested live 2026-05-11**
 - [x] `copilot/02` — guided agent walkthrough (Steps A–E)
 - [x] `copilot/03` — guided publish + admin approval walkthrough
 - [x] `setup/01–03` — macOS Apple Silicon toolchain, verified working

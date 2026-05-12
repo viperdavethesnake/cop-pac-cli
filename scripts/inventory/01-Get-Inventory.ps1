@@ -70,6 +70,7 @@ if (-not $graphConnected) {
 }
 
 # ── Current identity ──────────────────────────────────────────────────────────
+$ctx           = $null
 $myUpn         = $null
 $myAadObjectId = $null
 
@@ -80,19 +81,51 @@ if (-not $graphConnected) {
 } else {
     try {
         $ctx = Get-MgContext
-        $myUpn = $ctx.Account
-        if ($myUpn) {
-            # Use "me" endpoint — avoids needing User.ReadBasic.All for UPN lookup
-            $me = Get-MgUser -UserId "me" -Property Id,DisplayName,UserPrincipalName -ErrorAction SilentlyContinue
-            $myAadObjectId = $me?.Id
-            Write-Found "Signed in as: $myUpn"
-            Write-Info  "Entra Object ID: $myAadObjectId"
-        } else {
-            Write-Warn "Running as service principal (client-secret auth) — owner-filtered queries will be skipped"
+        $myUpn = $ctx.Account   # null when using client-secret (service principal) auth
+
+        if (-not $myUpn) {
+            # Service-principal auth — extract the logged-in user's UPN from PAC CLI
+            $pacLines   = pac auth list 2>&1
+            $activeLine = $pacLines | Where-Object { $_ -match '^\*' } | Select-Object -First 1
+            if ($activeLine -and $activeLine -match '\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b') {
+                $myUpn = $Matches[0]
+            }
         }
-        $inv.identity.upn          = $myUpn
-        $inv.identity.aadObjectId  = $myAadObjectId
-        $inv.identity.tenantId     = $env:ENTRA_TENANT_ID
+
+        # Record auth type (0=Delegated, 2=AppOnly) for troubleshooting
+        $inv.identity.authType = $ctx.AuthType
+
+        if ($myUpn) {
+            if ($ctx.Account) {
+                # Delegated auth — call /me directly; User.Read is sufficient and most reliable
+                try {
+                    $meData = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/me" -ErrorAction Stop
+                    $myAadObjectId = $meData.id   # hashtable key, lowercase
+                } catch {
+                    Write-Warn "Could not call /me: $($_.Exception.Message)"
+                }
+            } else {
+                # Application auth — look up by UPN; requires User.Read.All (application permission)
+                try {
+                    $me = Get-MgUser -UserId $myUpn -ErrorAction Stop
+                    $myAadObjectId = $me?.Id
+                } catch {
+                    Write-Warn "Could not look up user ${myUpn}: $($_.Exception.Message)"
+                }
+            }
+            Write-Found "Signed in as: $myUpn"
+            if ($myAadObjectId) {
+                Write-Info  "Entra Object ID: $myAadObjectId"
+            } else {
+                Write-Warn "Could not resolve Entra Object ID for $myUpn (owner-filtered queries will be skipped)"
+            }
+        } else {
+            Write-Warn "Could not determine current user — owner-filtered queries will be skipped"
+        }
+
+        $inv.identity.upn         = $myUpn
+        $inv.identity.aadObjectId = $myAadObjectId
+        $inv.identity.tenantId    = $env:ENTRA_TENANT_ID
     } catch {
         Write-Warn "Could not resolve current user: $($_.Exception.Message)"
     }
@@ -110,9 +143,25 @@ if (-not $graphConnected) {
     try {
         $app = $null
         if ($env:ENTRA_CLIENT_ID) {
-            # Try standard filter first; fall back to search if token lacks delegated Application.Read.All
+            # Try 1: standard filter (needs Application.Read.All — works with application permission)
             $app = Get-MgApplication -Filter "appId eq '$($env:ENTRA_CLIENT_ID)'" -ErrorAction SilentlyContinue
+
+            if (-not $app -and $ctx.Account) {
+                # Try 2: /me/ownedObjects — only needs User.Read (works with interactive/delegated auth)
+                try {
+                    $owned = Invoke-MgGraphRequest -Method GET `
+                        -Uri "https://graph.microsoft.com/v1.0/me/ownedObjects" -ErrorAction SilentlyContinue
+                    $match = (if ($null -ne $owned) { $owned['value'] } else { @() }) | Where-Object {
+                        $_['@odata.type'] -eq '#microsoft.graph.application' -and $_.appId -eq $env:ENTRA_CLIENT_ID
+                    } | Select-Object -First 1
+                    if ($match -and $match['id']) {
+                        $app = Get-MgApplication -ApplicationId $match['id'] -ErrorAction SilentlyContinue
+                    }
+                } catch {}
+            }
+
             if (-not $app) {
+                # Try 3: ConsistencyLevel search fallback
                 $app = Get-MgApplication -Search "`"appId:$($env:ENTRA_CLIENT_ID)`"" -ConsistencyLevel eventual -ErrorAction SilentlyContinue | Select-Object -First 1
             }
         }
@@ -141,7 +190,7 @@ if (-not $graphConnected) {
             }
 
             # Permissions summary
-            $sp = Get-MgServicePrincipal -Filter "appId eq '$($app.AppId)'" -ErrorAction SilentlyContinue
+            $sp = Get-MgServicePrincipal -Filter "appId eq '$($app.AppId)'" -ConsistencyLevel eventual -ErrorAction SilentlyContinue
             if ($sp) {
                 $grants          = @(Get-MgServicePrincipalOauth2PermissionGrant -ServicePrincipalId $sp.Id -ErrorAction SilentlyContinue)
                 $roleAssignments = @(Get-MgServicePrincipalAppRoleAssignment    -ServicePrincipalId $sp.Id -ErrorAction SilentlyContinue)
@@ -165,12 +214,49 @@ if (-not $graphConnected) {
                 delegatedGrants    = $grants?.Count
             }
         } else {
-            Write-Missing "App not found — ENTRA_CLIENT_ID not set or app not registered yet"
+            $reason = if ($env:ENTRA_CLIENT_ID) { "App $($env:ENTRA_CLIENT_ID) not found in tenant — may have been deleted. Re-run entra/01 to register." } else { "ENTRA_CLIENT_ID not set" }
+            Write-Missing $reason
             $inv.entra.app = [ordered]@{ found = $false }
         }
     } catch {
         Write-Warn "Entra query error: $($_.Exception.Message)"
         $inv.entra.error = $_.Exception.Message
+    }
+}
+
+# ── My Entra app registrations (owned by current user) ───────────────────────
+Write-Section "My Entra Apps"
+
+$inv.entra.myApps = @()
+
+if (-not $graphConnected) {
+    Write-Warn "Skipped — Graph not connected"
+} elseif (-not $ctx.Account) {
+    Write-Info "Service-principal auth — /me/ownedObjects not available; skipping owned app list"
+} else {
+    try {
+        $owned = Invoke-MgGraphRequest -Method GET `
+            -Uri "https://graph.microsoft.com/v1.0/me/ownedObjects" -ErrorAction Stop
+        # $owned['value'] — use explicit key indexing; $owned?.value silently returns null on Hashtable in PS7
+        $rawItems    = if ($null -ne $owned) { $owned['value'] } else { $null }
+        $allOwned    = if ($null -ne $rawItems) { @($rawItems) } else { @() }
+        $myOwnedApps = @($allOwned | Where-Object { $_ -and $_['@odata.type'] -eq '#microsoft.graph.application' })
+        $inv.entra.ownedObjectsTotal = $allOwned.Count
+        $inv.entra.ownedAppsFound    = $myOwnedApps.Count
+        if ($myOwnedApps) {
+            foreach ($a in $myOwnedApps) {
+                $isConfigured = ($a.appId -eq $env:ENTRA_CLIENT_ID)
+                $label = if ($isConfigured) { " (configured)" } else { "" }
+                $color = if ($isConfigured) { "Green" } else { "DarkGray" }
+                Write-Host "  $($a.displayName)  AppId: $($a.appId)$label" -ForegroundColor $color
+                $inv.entra.myApps += [ordered]@{ displayName = $a.displayName; appId = $a.appId; objectId = $a.id; configured = $isConfigured }
+            }
+        } else {
+            Write-Info "No app registrations owned by $myUpn"
+        }
+    } catch {
+        $inv.entra.ownedObjectsError = $_.Exception.Message
+        Write-Warn "Could not retrieve owned apps: $($_.Exception.Message)"
     }
 }
 
@@ -258,41 +344,52 @@ if (-not (Get-Command pac -ErrorAction SilentlyContinue)) {
     }
 
     # ── My connectors (all connectors owned by current user) ──────────────────
+    # Microsoft.PowerApps.Administration.PowerShell requires System.Windows.Forms
+    # (Windows-only). On macOS we skip owner-filtered lookup and note the limitation.
     if ($myAadObjectId) {
-        try {
-            Add-PowerAppsAccount -TenantID $env:ENTRA_TENANT_ID -Endpoint prod 2>&1 | Out-Null
-            $orgHost   = ([uri]$env:PPAC_ENVIRONMENT_URL).Host.Split('.')[0]
-            $targetEnv = Get-AdminEnvironment | Where-Object {
-                $_.Internal.properties.linkedEnvironmentMetadata.instanceUrl -match $orgHost
-            } | Select-Object -First 1
+        $winForms = $null
+        try { $winForms = [System.Windows.Forms.Form] } catch {}
 
-            if ($targetEnv) {
-                $allAdminConnectors = @(Get-AdminConnector -EnvironmentName $targetEnv.EnvironmentName -ErrorAction SilentlyContinue)
-                $myConnectors = $allAdminConnectors | Where-Object {
-                    $owner = $_.CreatedBy
-                    $owner -and ($owner.id -eq $myAadObjectId -or $owner.objectId -eq $myAadObjectId -or $owner.userPrincipalName -eq $myUpn)
-                }
+        if (-not $winForms) {
+            Write-Info "Owner-filtered connector list not available on macOS (PowerApps Admin module requires Windows Forms)"
+            $inv.powerApps.myConnectorsNote = "macOS: PowerApps Admin module requires System.Windows.Forms (Windows only). Owner filtering skipped."
+        } else {
+            try {
+                Add-PowerAppsAccount -TenantID $env:ENTRA_TENANT_ID -Endpoint prod 2>&1 | Out-Null
+                $orgHost   = ([uri]$env:PPAC_ENVIRONMENT_URL).Host.Split('.')[0]
+                $targetEnv = Get-AdminEnvironment | Where-Object {
+                    $_.Internal.properties.linkedEnvironmentMetadata.instanceUrl -match $orgHost
+                } | Select-Object -First 1
 
-                Write-Host ""
-                if ($myConnectors) {
-                    Write-Host "  My connectors in this environment ($myUpn):" -ForegroundColor Cyan
-                    foreach ($c in $myConnectors) {
-                        $isConfigured = ($c.DisplayName -eq $env:CONNECTOR_NAME)
-                        $label = if ($isConfigured) { " (configured)" } else { "" }
-                        $color = if ($isConfigured) { "Green" } else { "DarkGray" }
-                        Write-Host "    $($c.DisplayName)  ID: $($c.ConnectorName)$label" -ForegroundColor $color
+                if ($targetEnv) {
+                    $allAdminConnectors = @(Get-AdminConnector -EnvironmentName $targetEnv.EnvironmentName -ErrorAction SilentlyContinue)
+                    $inv.powerApps.adminConnectorTotal = $allAdminConnectors.Count
+                    $myConnectors = $allAdminConnectors | Where-Object {
+                        $owner = $_.CreatedBy
+                        $owner -and ($owner.id -eq $myAadObjectId -or $owner.objectId -eq $myAadObjectId -or $owner.userPrincipalName -eq $myUpn)
                     }
-                    $inv.powerApps.myConnectors = @($myConnectors | ForEach-Object {
-                        [ordered]@{ displayName = $_.DisplayName; id = $_.ConnectorName; configured = ($_.DisplayName -eq $env:CONNECTOR_NAME) }
-                    })
+                    if ($myConnectors) {
+                        Write-Host "  My connectors in this environment ($myUpn):" -ForegroundColor Cyan
+                        foreach ($c in $myConnectors) {
+                            $isConfigured = ($c.DisplayName -eq $env:CONNECTOR_NAME)
+                            $label = if ($isConfigured) { " (configured)" } else { "" }
+                            $color = if ($isConfigured) { "Green" } else { "DarkGray" }
+                            Write-Host "    $($c.DisplayName)  ID: $($c.ConnectorName)$label" -ForegroundColor $color
+                        }
+                        $inv.powerApps.myConnectors = @($myConnectors | ForEach-Object {
+                            [ordered]@{ displayName = $_.DisplayName; id = $_.ConnectorName; configured = ($_.DisplayName -eq $env:CONNECTOR_NAME) }
+                        })
+                    } else {
+                        Write-Info "No connectors owned by $myUpn in this environment"
+                    }
                 } else {
-                    Write-Info "No connectors owned by $myUpn in this environment"
+                    $inv.powerApps.myConnectorsError = "Could not resolve environment from PPAC_ENVIRONMENT_URL"
+                    Write-Warn "Could not resolve environment from PPAC_ENVIRONMENT_URL"
                 }
-            } else {
-                Write-Warn "Could not resolve environment from PPAC_ENVIRONMENT_URL"
+            } catch {
+                $inv.powerApps.myConnectorsError = $_.Exception.Message
+                Write-Warn "Owner-filtered connector query failed: $($_.Exception.Message)"
             }
-        } catch {
-            Write-Warn "Owner-filtered connector query failed: $($_.Exception.Message)"
         }
     } else {
         Write-Info "User identity not resolved — skipping owner-filtered connector list"

@@ -153,6 +153,9 @@ Import-Module powershell-yaml -ErrorAction Stop
 $swaggerYaml = Get-Content $swaggerSrc -Raw
 $swaggerObj  = ConvertFrom-Yaml $swaggerYaml
 
+$swaggerObj.info.title = $connectorName
+Write-Host "  info.title set to: $connectorName" -ForegroundColor DarkGray
+
 if ($env:NEXUS_AI_CONNECTOR_ID) {
     # Patch contentSource default in SearchRequest definition
     $swaggerObj.definitions.SearchRequest.properties.contentSource.default = `
@@ -262,25 +265,44 @@ if ($connectorGuid) {
 }
 
 # ── Step 4: Add Power Platform redirect URI to Entra app ─────────────────────
-# Power Platform always uses this fixed redirect URI for OAuth custom connectors.
-# It must be in the Entra app's reply URLs or token requests will be rejected.
+# Power Platform uses a per-connector redirect URI (not the old global one).
+# Download the connector to read the actual redirectUrl from apiProperties.json.
 Write-Host ""
-Write-Host "Adding Power Platform redirect URI to Entra app..." -ForegroundColor Cyan
+Write-Host "Reading connector redirect URI..." -ForegroundColor Cyan
 
-$ppRedirectUri = "https://global.consent.azure-apim.net/redirect"
+$ppRedirectUri = $null
+if ($connectorGuid) {
+    $tmpDlDir = Join-Path ([System.IO.Path]::GetTempPath()) "nexus-conn-dl-$(Get-Random)"
+    New-Item -ItemType Directory -Path $tmpDlDir -Force | Out-Null
+    try {
+        $null = & pac connector download --connector-id $connectorGuid --outputDirectory $tmpDlDir 2>&1
+        $propsFile = Get-ChildItem $tmpDlDir -Filter "apiProperties.json" -Recurse | Select-Object -First 1
+        if ($propsFile) {
+            $props = Get-Content $propsFile.FullName -Raw | ConvertFrom-Json
+            $ppRedirectUri = $props.properties.connectionParameters.token.oAuthSettings.redirectUrl
+        }
+    } finally {
+        Remove-Item $tmpDlDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 
-Connect-MgGraph -TenantId $env:ENTRA_TENANT_ID -Scopes "Application.ReadWrite.All" -NoWelcome
-
-$app = Get-MgApplication -Filter "appId eq '$($env:ENTRA_CLIENT_ID)'"
-if (-not $app) { throw "Entra app not found — ENTRA_CLIENT_ID may be wrong" }
-
-$existingUris = @($app.Web.RedirectUris)
-if ($ppRedirectUri -in $existingUris) {
-    Write-Host "  Redirect URI already present — skipping." -ForegroundColor DarkGray
+if (-not $ppRedirectUri) {
+    Write-Host "  WARNING: Could not read per-connector redirect URI." -ForegroundColor Yellow
+    Write-Host "  Open the connector Security tab in make.powerapps.com, copy the Redirect URL," -ForegroundColor Yellow
+    Write-Host "  and add it to the Entra app at portal.azure.com → App registrations → Authentication." -ForegroundColor Yellow
 } else {
-    $updatedUris = $existingUris + $ppRedirectUri
-    Update-MgApplication -ApplicationId $app.Id -Web @{ RedirectUris = [string[]]$updatedUris }
-    Write-Host "  Added: $ppRedirectUri" -ForegroundColor Green
+    Write-Host "  Redirect URI: $ppRedirectUri" -ForegroundColor DarkGray
+    Connect-MgGraph -TenantId $env:ENTRA_TENANT_ID -Scopes "Application.ReadWrite.All" -NoWelcome
+    $app = Get-MgApplication -Filter "appId eq '$($env:ENTRA_CLIENT_ID)'"
+    if (-not $app) { throw "Entra app not found — ENTRA_CLIENT_ID may be wrong" }
+    $existingUris = @($app.Web.RedirectUris)
+    if ($ppRedirectUri -in $existingUris) {
+        Write-Host "  Redirect URI already present — skipping." -ForegroundColor DarkGray
+    } else {
+        $updatedUris = $existingUris + $ppRedirectUri
+        Update-MgApplication -ApplicationId $app.Id -Web @{ RedirectUris = [string[]]$updatedUris }
+        Write-Host "  Added to Entra app." -ForegroundColor Green
+    }
 }
 
 # ── Step 5: Smoke test — token + Graph Search endpoint ───────────────────────
@@ -312,20 +334,14 @@ try {
                 contentSources = @("/external/connections/$($env:NEXUS_AI_CONNECTOR_ID)")
             })
         } | ConvertTo-Json -Depth 10
-        $label = "Graph Search (externalItem)"
+        $result = Invoke-RestMethod -Method POST -Uri "https://graph.microsoft.com/v1.0/search/query" `
+            -Headers $headers -Body $searchBody -ErrorAction Stop
+        $hits = $result.value[0].hitsContainers[0].total ?? 0
+        Write-Host "  [PASS] Graph Search (externalItem) — HTTP 200 ($hits hits)" -ForegroundColor Green
     } else {
-        $searchBody = @{
-            requests = @(@{
-                entityTypes = @("driveItem")
-                query       = @{ queryString = "test" }
-            })
-        } | ConvertTo-Json -Depth 10
-        $label = "Graph Search (driveItem — NEXUS_AI_CONNECTOR_ID not set yet)"
+        # driveItem search requires delegated auth — cannot be tested with client credentials.
+        Write-Host "  [SKIP] Graph Search — requires NEXUS_AI_CONNECTOR_ID (run nexus/06 first)" -ForegroundColor DarkGray
     }
-    $result = Invoke-RestMethod -Method POST -Uri "https://graph.microsoft.com/v1.0/search/query" `
-        -Headers $headers -Body $searchBody -ErrorAction Stop
-    $hits = $result.value[0].hitsContainers[0].total ?? 0
-    Write-Host "  [PASS] $label — HTTP 200 ($hits hits)" -ForegroundColor Green
 } catch {
     $code = $_.Exception.Response?.StatusCode.value__ ?? "err"
     Write-Host "  [FAIL] Graph Search failed (HTTP $code): $($_.Exception.Message)" -ForegroundColor Red

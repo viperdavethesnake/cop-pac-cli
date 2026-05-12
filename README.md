@@ -107,7 +107,7 @@ pwsh scripts/copilot/03-Publish-Agent.ps1          # guided publish + admin appr
 | `m365/01` | Tries beta API PATCH | Falls back to portal steps if API fails |
 | `m365/02` | Reports license availability | Assign licenses if needed |
 | `m365/03` | Checks connector state + item count | — |
-| `copilot/01` | Creates connector via PAC CLI, updates Entra redirect URI, runs smoke test | (1) Security tab: paste client secret, verify OBO field shows "true"; (2) Test tab → New Connection → Create; (3) Test tab → Test Operation; (4) Share tab: add users |
+| `copilot/01` | Creates connector via PAC CLI, reads per-connector redirect URI from downloaded `apiProperties.json`, registers it with Entra app, runs smoke test (skipped until `NEXUS_AI_CONNECTOR_ID` set) | (1) Security tab: paste client secret, verify OBO field shows "true"; (2) Test tab → New Connection → Create; (3) Test tab → Test Operation; (4) Share tab: add users. Note: `CONNECTOR_NAME` must be ≤30 chars. |
 | `copilot/02` | Prints all values and instructions | Copilot Studio UI (agent + tools) |
 | `copilot/03` | Prints all steps | Copilot Studio + admin approval portal |
 | `cloudfs/01` | Prints exact UI steps | CloudFS web UI (8.7.0 has no API) |
@@ -124,7 +124,7 @@ pwsh scripts/copilot/03-Publish-Agent.ps1          # guided publish + admin appr
 | Entra ID app registration | `scripts/entra/01–03` | Complete |
 | Nexus REST API configuration | `scripts/nexus/01–06` | Stubs — endpoints confirmed on live Nexus |
 | M365 licensing + connector visibility | `scripts/m365/01–03` | Complete |
-| Power Apps custom connector | `scripts/copilot/01` | Complete |
+| Power Apps custom connector | `scripts/copilot/01` | Complete — tested 2026-05-11 |
 | Copilot Studio agent | `scripts/copilot/02–03` | Guided walkthrough (UI workflow) |
 | CloudFS audit settings | `scripts/cloudfs/01` | Guided walkthrough (8.7.0 UI-only) |
 | Power Platform service principal | `scripts/power-platform/` | Low priority — Path B only |

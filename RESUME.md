@@ -1,6 +1,6 @@
 # Nexus Automation — Resume File
 
-Last updated: 2026-05-05
+Last updated: 2026-05-11
 
 Use this file to orient any new session. Read TODO.md for the full task list.
 
@@ -32,7 +32,7 @@ Working directory: `/Users/dmbarley/claude/`
 | Graph connector visibility | `m365/01` | Complete — run after nexus/06 |
 | Copilot license report | `m365/02` | Complete |
 | Connector health check | `m365/03` | Complete — run after nexus/06 |
-| Custom connector (PAC CLI) | `copilot/01` | Complete — needs pac auth create first |
+| Custom connector (PAC CLI) | `copilot/01` | Complete — **tested live 2026-05-11** |
 | Copilot Studio agent guide | `copilot/02` | Complete — guided UI walkthrough |
 | Publish + admin approval | `copilot/03` | Complete — guided UI walkthrough |
 | CloudFS audit settings | `cloudfs/01` | Complete — guided UI walkthrough |
@@ -64,6 +64,10 @@ They are missing only the actual REST endpoint paths (URLs to confirm via browse
 **PAC CLI = dotnet tool, not npm** — `dotnet tool install --global Microsoft.PowerApps.CLI.Tool`. On Apple Silicon, requires `DOTNET_ROOT=/opt/homebrew/opt/dotnet/libexec`. `pac --version` doesn't work — use `pac help` to verify install. See `setup/README.md`.
 
 **Client secret NOT in PAC CLI call** — Power Platform custom connectors don't accept client secrets via CLI. The secret is entered manually in the Power Apps portal Security tab after `pac connector create` runs. `copilot/01` prints the secret value and exact portal steps.
+
+**Per-connector redirect URI** — Power Platform generates a unique redirect URI per connector (`https://global.consent.azure-apim.net/redirect/<connector-unique-name>`). `copilot/01` downloads the connector post-create, reads the actual `redirectUrl` from `apiProperties.json`, and registers it with the Entra app. The old generic redirect URI no longer works.
+
+**`CONNECTOR_NAME` max 30 chars** — Power Platform enforces a 30-character limit on the OpenAPI `info.title`. `copilot/01` patches the title from `.env`. Keep `CONNECTOR_NAME` ≤30 chars.
 
 **`copilot/02` is UI-only** — `pac copilot create` does not exist. Copilot Studio agent creation has no CLI interface. The script is a guided walkthrough — all steps happen in the browser.
 
@@ -99,12 +103,18 @@ pwsh scripts/entra/03-New-ClientSecret.ps1    # writes ENTRA_CLIENT_SECRET to .e
 #    - Client secret listed under Certificates & secrets
 ```
 
-After `entra/03`, test `copilot/01` if a Power Platform environment is available:
+After `entra/03`, run `copilot/01` (Power Platform environment required, PPAC_ENVIRONMENT_URL in .env):
 ```powershell
-pac auth create --environment <your-env-url>   # or use PPAC_ENVIRONMENT_URL in .env
 pwsh scripts/copilot/01-New-CustomConnector.ps1
-# verify connector appears in make.powerapps.com
+# Creates connector, auto-detects per-connector redirect URI, adds to Entra app
+# Then complete 4 manual steps: Security tab (paste secret), New Connection, Test Operation, Share
 ```
+
+**`copilot/01` notes (from live test 2026-05-11):**
+- `CONNECTOR_NAME` must be ≤30 characters (Power Platform limit)
+- Script patches swagger `info.title` from `.env` CONNECTOR_NAME — do not rely on the swagger file's title
+- Per-connector redirect URI is read from `apiProperties.json` after creation — the old generic `https://global.consent.azure-apim.net/redirect` no longer works
+- Smoke test skips Graph Search until `NEXUS_AI_CONNECTOR_ID` is set (driveItem search requires delegated auth; externalItem is tested once Nexus is connected)
 
 ---
 

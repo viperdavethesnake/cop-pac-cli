@@ -101,8 +101,9 @@ foreach ($mod in $requiredModules) {
 }
 
 # ── .env Stage 1 keys ─────────────────────────────────────────────────────────
-$envPath     = Join-Path $PSScriptRoot "../.env"
-$envTenantId = $null
+$envPath      = Join-Path $PSScriptRoot "../.env"
+$envTenantId  = $null
+$envAdminUpn  = $null
 
 Check ".env Stage 1 keys" {
     if (-not (Test-Path $envPath)) {
@@ -119,6 +120,7 @@ Check ".env Stage 1 keys" {
         throw "Missing required values in .env: $($missing -join ', ')"
     }
     $script:envTenantId = $envVals['ENTRA_TENANT_ID']
+    $script:envAdminUpn = $envVals['ENTRA_ADMIN_UPN']
     "ENTRA_TENANT_ID, ENTRA_APP_NAME, CONNECTOR_NAME all set ✓"
 } -FixCmd "cp .env.example .env" -FixNote "Then fill in: ENTRA_TENANT_ID, ENTRA_APP_NAME, CONNECTOR_NAME"
 
@@ -161,6 +163,44 @@ Check "PAC CLI: copilot command" {
     "pac copilot available ✓"
 } -FixNote "If this fails, DOTNET_ROOT is likely wrong"
 
+# ── Microsoft Graph authentication ───────────────────────────────────────────
+Check "Microsoft Graph: authenticated to correct account" {
+    Import-Module Microsoft.Graph.Authentication -ErrorAction SilentlyContinue
+    if (-not (Get-Command Get-MgContext -ErrorAction SilentlyContinue)) {
+        throw "Microsoft.Graph module not available — run: pwsh setup/02-Install-PSModules.ps1"
+    }
+
+    $ctx = Get-MgContext
+    if (-not $ctx) {
+        if (-not $envTenantId) { throw "ENTRA_TENANT_ID not set — cannot establish Graph session" }
+        Connect-MgGraph -TenantId $envTenantId -Scopes "User.Read" -NoWelcome -ErrorAction Stop
+        $ctx = Get-MgContext
+    }
+
+    if (-not $ctx) { throw "Graph connection failed — no context returned" }
+
+    $account = $ctx.Account
+    if (-not $account) {
+        throw "Graph session active but no user account found — may be service-principal auth; verify manually"
+    }
+
+    $graphTenantId = $ctx.TenantId
+    if ($envTenantId -and $graphTenantId -and $graphTenantId -ne $envTenantId) {
+        throw "Wrong tenant — Graph session is in $graphTenantId but .env specifies $envTenantId"
+    }
+
+    if ($envAdminUpn -and $account -ne $envAdminUpn) {
+        throw "Wrong account — Graph session is $account but ENTRA_ADMIN_UPN=$envAdminUpn"
+    }
+
+    $tenantNote = if ($graphTenantId) { "tenant $graphTenantId ✓" } else { "tenant unverifiable" }
+    if (-not $envAdminUpn) {
+        "Connected as $account — $tenantNote (set ENTRA_ADMIN_UPN in .env to enforce this account)"
+    } else {
+        "Connected as $account — $tenantNote"
+    }
+} -FixCmd "Disconnect-MgGraph; Connect-MgGraph -TenantId `$envTenantId -Scopes 'User.Read' -NoWelcome"
+
 # ── Print results ─────────────────────────────────────────────────────────────
 Write-Host ""
 foreach ($r in $results) {
@@ -183,19 +223,18 @@ $statusColor = if ($fail -gt 0) { "Red" } elseif ($warn -gt 0) { "Yellow" } else
 Write-Host "Results: $pass PASS  |  $warn WARN  |  $fail FAIL" -ForegroundColor $statusColor
 
 if ($fail -gt 0) {
-    # If the only failure is PAC CLI auth and we have a tenant ID, offer to fix it now
-    $pacAuthFail = $results | Where-Object { $_.Status -eq "FAIL" -and $_.Label -like "PAC CLI: authenticated*" }
-    $otherFails  = $results | Where-Object { $_.Status -eq "FAIL" -and $_.Label -notlike "PAC CLI: authenticated*" }
+    $pacAuthFail   = $results | Where-Object { $_.Status -eq "FAIL" -and $_.Label -like "PAC CLI: authenticated*" }
+    $graphAuthFail = $results | Where-Object { $_.Status -eq "FAIL" -and $_.Label -like "Microsoft Graph: authenticated*" }
+    $otherFails    = $results | Where-Object { $_.Status -eq "FAIL" -and $_.Label -notlike "PAC CLI: authenticated*" -and $_.Label -notlike "Microsoft Graph: authenticated*" }
 
-    if ($pacAuthFail -and -not $otherFails -and $envTenantId) {
+    # PAC CLI auth auto-fix (only when it's the sole failure)
+    if ($pacAuthFail -and -not $graphAuthFail -and -not $otherFails -and $envTenantId) {
         Write-Host ""
         if ($pacAuthFail.Detail -match '^Wrong tenant') {
-            # Mismatch — could be wrong .env or wrong PAC CLI session; don't assume
             Write-Host "Tenant mismatch — check which side is correct:" -ForegroundColor Yellow
             Write-Host "  If .env is correct:        pac auth clear; pac auth create --tenant $envTenantId" -ForegroundColor White
             Write-Host "  If PAC CLI is correct:     update ENTRA_TENANT_ID in .env to match the connected tenant" -ForegroundColor White
         } else {
-            # Not authenticated at all — .env tenant is authoritative, just need to log in
             Write-Host "The only failure is PAC CLI authentication." -ForegroundColor Yellow
             $answer = Read-Host "Fix it now? This will open a browser for tenant $envTenantId [Y/n]"
             if ($answer -eq '' -or $answer -match '^[Yy]') {
@@ -210,6 +249,36 @@ if ($fail -gt 0) {
                     exit $LASTEXITCODE
                 } else {
                     Write-Host "Authentication failed. Try manually: pac auth create --tenant $envTenantId" -ForegroundColor Red
+                    exit 1
+                }
+            }
+        }
+    }
+
+    # Graph auth auto-fix (only when it's the sole failure)
+    if ($graphAuthFail -and -not $pacAuthFail -and -not $otherFails -and $envTenantId) {
+        Write-Host ""
+        if ($graphAuthFail.Detail -match '^Wrong tenant') {
+            Write-Host "Graph tenant mismatch — check which side is correct:" -ForegroundColor Yellow
+            Write-Host "  If .env is correct:        Disconnect-MgGraph; Connect-MgGraph -TenantId $envTenantId -Scopes 'User.Read' -NoWelcome" -ForegroundColor White
+            Write-Host "  If Graph session is correct: update ENTRA_TENANT_ID in .env to match" -ForegroundColor White
+        } else {
+            $targetAccount = if ($envAdminUpn) { $envAdminUpn } else { "your Entra admin account" }
+            Write-Host "The only failure is Microsoft Graph authentication." -ForegroundColor Yellow
+            $answer = Read-Host "Fix it now? This will reconnect Graph as $targetAccount [Y/n]"
+            if ($answer -eq '' -or $answer -match '^[Yy]') {
+                Write-Host ""
+                try { Disconnect-MgGraph -ErrorAction SilentlyContinue 2>&1 | Out-Null } catch {}
+                try {
+                    Connect-MgGraph -TenantId $envTenantId -Scopes "User.Read" -NoWelcome -ErrorAction Stop
+                    Write-Host ""
+                    Write-Host "Authenticated. Re-running verification..." -ForegroundColor Green
+                    Write-Host ""
+                    & $PSCommandPath
+                    exit $LASTEXITCODE
+                } catch {
+                    Write-Host "Authentication failed: $($_.Exception.Message)" -ForegroundColor Red
+                    Write-Host "Try manually: Connect-MgGraph -TenantId $envTenantId -Scopes 'User.Read' -NoWelcome" -ForegroundColor White
                     exit 1
                 }
             }
